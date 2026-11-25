@@ -21,12 +21,14 @@ Two ways to run it:
     no_silent_fallbacks.py                          # Claude Code PreToolUse hook: tool call on stdin
 
 As a hook it builds the file as it would be after the edit and judges only what the edit adds.
-Exit 2 blocks the edit and sends the report to Claude.
+A Bash command that writes a source file itself (sed -i, a redirect, an inline script) is refused, since
+that change would not be checked. Exit 2 blocks the call and sends the report to Claude.
 """
 import argparse
 import ast
 import hashlib
 import json
+import operator
 import os
 import re
 import shlex
@@ -49,6 +51,9 @@ KEYWORD = re.compile(
     r'|dummy|defensive(ly)?|band-?aid|(safe|sensible|reasonable|sane) (default|value|number)|default(s|ed|ing)? to|on (error|failure),? (return|use|skip|continue)|if (all else|that) fails)\b', re.I)
 KEYWORD_NEGATED = re.compile(
     r"\b(not|never|no longer|instead of|rather than|refus\w*|reject\w*|without|cannot|can't|don't|doesn't|must not)\b", re.I)
+NOTHING = re.compile(r'\bnothing\b', re.I)  # negates only a keyword that comes after it on the line
+ATOM = r"""(?:-?\d[\d._]*(?:e-?\d+)?|'[^']*'|"[^"]*"|None|True|False)"""  # one literal constant
+NUMBER = r'\d[\d._]*(?:e-?\d+)?'
 
 # (rule, pattern, why). Applied to code lines; comment-only lines get the keyword rule alone.
 PY_LINES = [
@@ -59,8 +64,9 @@ PY_LINES = [
      re.compile(r'''\.get\(\s*[^(),]+,\s*\w+(\.\w+)*\[[^\]]+\]\s*\)'''),
      'a missing field is replaced by a different field; the two are not the same measurement'),
     ('py-or-default',
-     re.compile(r'''\bor\s+(0(\.0+)?|''|""|\{\}|\[\]|\(\)|None|False)\s*(?=[),\]}:;]|#|$)'''),
-     '`x or <empty>` turns a missing or null value into an ordinary one'),
+     re.compile(rf'''\bor\s+(?:{ATOM}|\[(?:\s*{ATOM}\s*(?:,|(?=\])))*\s*\]|\((?:\s*{ATOM}\s*(?:,|(?=\))))*\s*\)'''
+                rf'''|\{{(?:\s*{ATOM}\s*(?::\s*{ATOM}\s*)?(?:,|(?=\}})))*\s*\}}|dict\(\)|list\(\)|set\(\))\s*(?=[),\]}}:;]|#|$)'''),
+     '`x or <literal>` turns a missing or null value into an ordinary one'),
     ('py-getattr-default',
      re.compile(r'\bgetattr\(\s*[^(),]+,\s*[^(),]+,\s*[^()]*\)'),
      'a missing attribute is replaced by a default'),
@@ -74,8 +80,9 @@ PY_LINES = [
      re.compile(r'''errors\s*=\s*['"](ignore|replace|surrogateescape)['"]'''),
      'undecodable bytes are dropped or replaced without a trace'),
     ('py-divide-guard',
-     re.compile(r'/\s*max\((?:\s*1\s*,|(?:[^()]|\([^()]*\))*,\s*1\s*\))'),
-     'dividing by max(n, 1) reports a rate for empty input instead of saying there was none'),
+     re.compile(rf'/\s*(?:max\((?:\s*{NUMBER}\s*,|(?:[^()]|\([^()]*\))*,\s*{NUMBER}\s*\))'
+                rf'|[\w.\[\]]+(?:\([^()]*\))?\.clamp(?:_min)?\(\s*(?:min\s*=\s*)?{NUMBER}|torch\.clamp\((?:[^()]|\([^()]*\))*\bmin\s*=\s*{NUMBER})'),
+     'a floor under the divisor (max(n, 1), max(t, 1e-9), clamp(min=1)) reports a rate for empty input instead of saying there was none'),
     ('py-else-label',
      re.compile(r'''=\s*.*\bif\b.+\belse\s+(['"])[A-Za-z][\w-]*\1(?!\s*(if|\+|%|\.))'''),
      'the else branch gives every unrecognised case a concrete label; make "unknown" its own value or raise'),
@@ -90,9 +97,6 @@ SH_LINES = [
     ('sh-stderr-null',
      re.compile(r'(2>|&>|2>>)\s*/dev/null|>\s*/dev/null\s+2>&1'),
      'the error text is thrown away, so a failure cannot be told from a normal negative'),
-    ('sh-default-expansion',
-     re.compile(r'\$\{[A-Za-z_][A-Za-z0-9_]*:?[-=][^}]+\}'),
-     'an unset variable gets a default; require it with ${VAR:?message}, or set the default once at the top'),
     ('sh-errexit-off',
      re.compile(r'\bset\s+(\+e\b|\+o\s+(errexit|pipefail))'),
      'turns off exit-on-error'),
@@ -102,6 +106,23 @@ SH_LINES = [
     ('sh-kill-wait',
      re.compile(r'\bkill\b[^#|]*?(;|&&)\s*wait\b'),
      '`wait` after `kill` never returns for a process that ignores the signal; bound it and escalate to KILL'),
+    ('sh-prefix-forward',
+     re.compile(r'''\b(?:env|printenv|export\s+-p|declare\s+-x|set)\s*\|\s*grep\b[^|;&]*\^[A-Za-z][A-Za-z0-9]*_|\bcompgen\s+-[ev]\s+[A-Za-z]\w*_\b'''
+                r'''|\$\{![A-Za-z]\w*_[@*]\}|=~\s*["']?\^[A-Z][A-Z0-9_]*_(?:\[|\.[*+]|\\w)'''),
+     'settings are taken by name prefix, so a misspelt one is passed on and the script that reads specific names runs on its own '
+     'value for the real one, with no word of it; list the accepted names and refuse any other'),
+    ('sh-pgrep-self',
+     re.compile(r'''\b(?:pgrep|pkill)\s+(?:-\S+\s+)*-[A-Za-z]*f[A-Za-z]*\s+(?:-\S+\s+)*\\?["']?[A-Za-z0-9_/.]'''),
+     '-f matches whole command lines, and a shell whose own command line holds this pattern (ssh "...", bash -c) matches too: the '
+     "check passes on itself, or the kill lands on its sender; bracket the first character, as in '[r]unpodctl remove'"),
+    ('sh-grep-log',
+     re.compile(r'''(?:(?:\b(?:if|elif|while|until)\b|&&|\|\||^\s*!)\s*(?:!\s*)?{grep}|{grep}(?:[^|;&\n]|>&)*(?:&&|\|\|))'''.replace(
+         '{grep}', r'''\bgrep\b(?:[^|;&\n]|>&)*?['"](?!\$)[^'"]*[A-Za-z]{3}[^'"]*['"](?:[^|;&\n]|>&)*?\.log\b''')),
+     "this branch depends on a tool's exact wording in a log: a reworded message (a new version, another locale) switches it off "
+     'and nothing shows; take the fact from an exit status or a field the tool reports, and fail when neither wording is found'),
+    ('sh-bare-exit',
+     re.compile(r'\|\|\s*(?:exit|return)\s+[1-9]\d*\b'),
+     'stops here with a status and no word of why; say what was wrong first: || { echo "..." >&2; exit N; }'),
 ]
 
 # --- waits with no limit, installs with no version, defaults left to a library -------------------------------------
@@ -118,6 +139,7 @@ SH_LOOP_CLOSE = re.compile(r'(?:^|[;&|(){}])\s*done\b')
 SH_BOUND = re.compile(r'SECONDS|date\s+\+%s|\(\(|\btimeout\b|deadline|tries|attempt|retr(y|ies)|\bseq\b', re.I)
 SH_TEARDOWN = re.compile(r'\brunpodctl\s+(remove|stop)\b|\baws\s+ec2\s+(terminate|stop)-instances\b'
                          r'|\bgcloud\s+compute\s+instances\s+(delete|stop)\b')
+MONEY = re.compile(r'usd|price|cost|dollar', re.I)
 NETWORK_CALL = re.compile(r'(requests|httpx)\.(get|post|put|patch|delete|head|request)|(urllib\.request\.)?urlopen')
 LIMIT_SH = [re.compile(r'\btimeout\s+(?:-\S+\s+)*(\d+(?:\.\d+)?)[smh]?\b'),
             re.compile(r'\b\w*(?:TIMEOUT|DEADLINE|WAIT)\w*(?:=|:-)(\d+(?:\.\d+)?)\b')]  # not LIMIT: that names counts as often as times
@@ -125,26 +147,96 @@ LIMIT_PY = [re.compile(r'\b\w*(?:timeout|deadline)\w*\s*=\s*(\d+(?:\.\d+)?)\b(?!
 CAP = re.compile(r'cap:\s*(\d+(?:\.\d+)?)\s*x\s+(measured|estimated)\s+(\d+(?:\.\d+)?)\s*(s|min|h)\b')
 CAP_MULTIPLE = {'measured': 2.0, 'estimated': 3.0}
 CONFIG_NAME = '.no-silent-fallbacks.json'
-NO_SETTINGS = dict(explicit_arguments={}, limit_basis=False)
+NO_SETTINGS = dict(explicit_arguments={}, limit_basis=False, folder=None)
+PIP_PROJECT = re.compile(r'\.(?:\[([\w,.-]+)\])?')
+PIP_PIN = re.compile(r'\s*([A-Za-z0-9][\w.-]*)(?:\[[^\]]*\])?\s*==\s*[\w.!+-]+\s*(?:;.*)?')
+SH_DEFAULT = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*):?[-=][^}]+\}')
+SH_TEST = re.compile(r'\[\[\s.*?\s\]\]')
+SH_COUNTED = re.compile(r'\bseq\b|\{\d+\.\.\d+\}|\(\(')
+SH_TRY_LIMIT = re.compile(r'--max-time|--connect-timeout|\btimeout\s+(?:-\S+\s+)*["$\d]|\s-m\s+\d')
+SH_CLOCK = re.compile(r'SECONDS|date\s+\+%s')
+SH_PIPEFAIL = re.compile(r'^\s*set\s+(?:-\w+\s+)*-\w*o\s+pipefail', re.M)
 
 
-def unpinned(line):
-    """Package names a `pip install` on this line leaves without an exact version."""
+def nearest(folder, name):
+    """The closest file called `name` in `folder` or a folder above it, or None when there is none."""
+    for candidate in (folder, *folder.parents):
+        if (candidate / name).is_file():
+            return candidate / name
+    return None
+
+
+def canonical(name):
+    return re.sub(r'[-_.]+', '-', name).lower()
+
+
+def pins(folder, words):
+    """Package names that an install line with these words pins in another file: `name==version` in a requirements file it names
+    with -r, and, where the line or that file installs the project itself (`.`, `-e .[extra]`), in the project table of
+    pyproject.toml, for the extras asked for. Each file is the nearest of its name at or above `folder`."""
+    entries = [(folder, word) for word in words]
+    for name in (words[i+1] for i, word in enumerate(words[:-1]) if word in ('-r', '--requirement')):
+        listed = nearest(folder, Path(name).name) if '$' not in name else None
+        if listed:
+            entries += [(listed.parent, entry.split('#')[0]) for entry in listed.read_text().split('\n')]
+    requirements = [entry for _, entry in entries]
+    for base, entry in entries:
+        project = PIP_PROJECT.fullmatch(entry.strip().removeprefix('-e').strip())
+        described = nearest(base, 'pyproject.toml') if project else None
+        if described and sys.version_info >= (3, 11):  # tomllib; an older Python reads no pyproject, and the name stays flagged
+            import tomllib
+            data = tomllib.loads(described.read_text())
+            if 'project' in data:
+                requirements += data['project']['dependencies'] if 'dependencies' in data['project'] else []
+                for extra in (project.group(1).split(',') if project.group(1) else []):
+                    requirements += data['project']['optional-dependencies'][extra]  # an extra the project lacks raises
+    return {canonical(pin.group(1)) for pin in map(PIP_PIN.fullmatch, requirements) if pin}
+
+
+def unpinned(line, folder=None):
+    """Package names a `pip install` on this line leaves without an exact version, here or in a file `pins` reads."""
     names = []
     for match in PIP_INSTALL.finditer(line):
+        words = [word.strip('\'"') for word in match.group(1).split()]
+        pinned = pins(folder, words) if folder else set()
         value_next = False
-        for word in match.group(1).split():
-            word = word.strip('\'"')
+        for word in words:
             if value_next or word in PIP_TAKES_VALUE:
                 value_next = not value_next
-            elif not word.startswith(('-', '.')) and not re.search(r'[/$@]|==', word) and PIP_NAME.fullmatch(word):
+            elif not word.startswith(('-', '.')) and not re.search(r'[/$@]|==', word) and PIP_NAME.fullmatch(word) \
+                    and canonical(re.match(r'[\w.-]+', word).group()) not in pinned:
                 names.append(word)
     return names
 
 
+def shell_defaults(lines):
+    """Lines that give an unset variable a default, less the two forms that state it once and use it for nothing else on the way:
+    inside a `[[ ]]` test, and `VAR=${VAR:-value}`. Neither is spared when the file defaults the same variable in more than one place."""
+    code = [(number, line) for number, line in enumerate(lines, 1) if not line.strip().startswith('#')]
+    places = Counter(match.group(1) for _, line in code for match in SH_DEFAULT.finditer(line))
+    for number, line in code:
+        tests = [test.span() for test in SH_TEST.finditer(line)]
+        for match in SH_DEFAULT.finditer(line):
+            name = match.group(1)
+            tested = any(first < match.start() and match.end() < last for first, last in tests)
+            assigned = re.search(r'(?:^|[;&]|\b(?:export|local|readonly|declare))\s*' + name + r'="?$', line[:match.start()]) \
+                and re.match(r'"?\s*(?:;|#|$)', line[match.end():])
+            if places[name] > 1 or not (tested or assigned):
+                yield ('sh-default-expansion', number,
+                       'an unset variable gets a default; require it with ${VAR:?message}, or set the default once at the top (VAR=${VAR:-value})')
+                break
+
+
 def shell_structure(lines):
-    """Findings that need more than one line: a polling loop with no limit, a machine removed with a single call."""
+    """Findings that need more than one line: a polling loop with no limit, a retry loop whose worst case is longer than its
+    count says, a machine removed with a single call, `grep -q` at the end of a pipeline under pipefail."""
     code = [SH_QUOTED.sub('""', line.split(' #')[0]) if not line.strip().startswith('#') else '' for line in lines]
+    if SH_PIPEFAIL.search('\n'.join(code)):
+        for number, line in enumerate(code, 1):
+            if re.search(r'(?<!\|)\|\s*grep\s+(?:-\S+\s+)*-[A-Za-z]*q', line):
+                yield ('sh-pipefail-grep-q', number,
+                       'under pipefail, `grep -q` leaves at its first match, the command feeding it can then die writing to a closed pipe, '
+                       'and the pipeline reports failure after a match; read the output into a variable first, or grep without -q into /dev/null')
     spans, open_loops = [], []
     for number, line in enumerate(code, 1):
         events = [(m.start(), 'open', m.group(1)) for m in SH_LOOP_OPEN.finditer(line)] + [(m.start(), 'close', '') for m in SH_LOOP_CLOSE.finditer(line)]
@@ -160,6 +252,11 @@ def shell_structure(lines):
             yield ('sh-loop-no-limit', first,
                    'this loop polls until something happens and has no limit, so a thing that never happens is waited for at full cost; '
                    'give it a deadline (SECONDS, a counter) and fail when it passes')
+        if kind == 'for' and SH_COUNTED.search(lines[first-1]) and re.search(r'\bsleep\b', block) and SH_TRY_LIMIT.search(block) \
+                and not SH_CLOCK.search(block):
+            yield ('sh-retry-worst-case', first,
+                   'this loop is counted in tries, and one try can take its sleep plus its own time limit: the worst case is '
+                   'tries x (sleep + limit), which a count read as tries x sleep understates; bound the loop by a deadline (SECONDS)')
     for number, line in enumerate(code, 1):  # quoted text is left out: `pgrep -f 'runpodctl remove'` removes nothing
         match = SH_TEARDOWN.search(line)
         if not match:
@@ -202,6 +299,12 @@ def python_calls(tree, explicit):
         unseen = any(k.arg is None and not (isinstance(k.value, ast.Name) and k.value.id in known) for k in node.keywords)
         if NETWORK_CALL.fullmatch(name) and 'timeout' not in given and not unseen and len(node.args) < 3:
             yield ('py-no-timeout', node.lineno, 'no timeout: a stalled connection makes this call wait with no limit, and a wait reports nothing')
+        priced = [a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str) and MONEY.search(a.value)]
+        preset = [ast.unparse(k.value) for k in node.keywords if k.arg == 'default' and re.fullmatch(r'-?\d[\d._e+-]*', ast.unparse(k.value))]
+        if name.endswith('add_argument') and priced and preset:
+            yield ('py-money-default', node.lineno,
+                   f'{priced[0]} is a price or an amount of money with a default ({preset[0]}): a caller that leaves it out is metered '
+                   'at that number, and at 0 every call counts as free and a spend cap never trips; make it required')
         for callee, required in explicit.items():
             absent = [argument for argument in required if argument not in given]
             if absent and (name == callee or name.endswith('.' + callee)):
@@ -235,12 +338,10 @@ def project_settings(path):
          "limit_basis": ["ops/*.sh"]}                                    files whose time limits need a `cap:` comment
     """
     folder = Path(path).resolve().parent
-    for candidate in (folder, *folder.parents):
-        config = candidate / CONFIG_NAME
-        if config.is_file():
-            break
-    else:
-        return NO_SETTINGS
+    config = nearest(folder, CONFIG_NAME)
+    if config is None:
+        return dict(NO_SETTINGS, folder=folder)
+    candidate = config.parent
     raw = json.loads(config.read_text())
     explicit = raw.pop('explicit_arguments') if 'explicit_arguments' in raw else {}
     globs = raw.pop('limit_basis') if 'limit_basis' in raw else []
@@ -249,7 +350,7 @@ def project_settings(path):
         raise ValueError(f'{config}: expected "explicit_arguments" (call name to a list of argument names) and "limit_basis" '
                          f'(a list of path patterns); unknown entries: {sorted(raw)}')
     relative = Path(path).resolve().relative_to(candidate)
-    return dict(explicit_arguments=explicit, limit_basis=any(relative.match(g) for g in globs))
+    return dict(explicit_arguments=explicit, limit_basis=any(relative.match(g) for g in globs), folder=folder)
 EXCEPT_SWALLOW = 'the handler neither re-raises nor looks at the exception: the error ends here and the code carries on'
 # The same shape without a syntax tree, for text that does not parse: an except that goes straight to a constant.
 PY_EXCEPT = re.compile(r'''^[ \t]*except\b[^\n]*:[ \t]*(?:#[^\n]*)?\n?[ \t]*(?:pass|continue|break|return(?:[ \t]+(?:None|True|False|-?\d[\d.]*|''|""|\[\]|\{\}|\(\)))?)[ \t]*(?:#[^\n]*)?$''', re.M)
@@ -361,6 +462,60 @@ def python_tree(tree):
                 yield ('py-unchecked-command', node.lineno, 'the exit status of this command is never looked at')
 
 
+COMPARE = {ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt, ast.LtE: operator.le, ast.Gt: operator.gt, ast.GtE: operator.ge,
+           ast.In: lambda value, group: value in group, ast.NotIn: lambda value, group: value not in group}
+
+
+def plain_literal(node):
+    return isinstance(node, ast.Constant) or (isinstance(node, (ast.Tuple, ast.List, ast.Set)) and all(isinstance(e, ast.Constant) for e in node.elts))
+
+
+def absence_stops(call, absent, parents):
+    """Is this `.get()` compared with a literal so that a missing key, read as `absent`, takes a branch that raises? Then absence
+    is treated like any value that fails the check, and the comparison hides nothing."""
+    test = parents[call]
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1 and test.left is call and plain_literal(test.comparators[0])):
+        return False
+    other, kind = ast.literal_eval(test.comparators[0]), type(test.ops[0])
+    ordered = kind not in (ast.Eq, ast.NotEq, ast.In, ast.NotIn)
+    if (kind in (ast.In, ast.NotIn)) != isinstance(other, (tuple, list, set)) or (
+            ordered and not (type(absent) in (int, float) and type(other) in (int, float))):
+        return False
+    truth, node = COMPARE[kind](absent, other), test
+    while True:  # `and`/`or` pass the direction on, as do any() of a true item and all() of a false one; `not` turns it round
+        outer = parents[node]
+        quantified = isinstance(outer, (ast.GeneratorExp, ast.ListComp)) and outer.elt is node and isinstance(parents[outer], ast.Call) \
+            and isinstance(parents[outer].func, ast.Name) and (parents[outer].func.id, truth) in (('any', True), ('all', False))
+        if isinstance(outer, ast.UnaryOp) and isinstance(outer.op, ast.Not):
+            truth = not truth
+        elif not (isinstance(outer, ast.BoolOp) or quantified):
+            break
+        node = parents[outer] if quantified else outer
+    branch = parents[node]
+    return isinstance(branch, ast.If) and branch.test is node and stops(branch.body if truth else branch.orelse)
+
+
+def python_gets(tree):
+    """`.get(key)` compared with a literal, as findings; and the lines on which every `.get(key, <literal>)` is a comparison whose
+    missing-key case raises, which `py-get-default` then leaves alone."""
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    found, defaults = [], {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'get' and not node.keywords):
+            continue
+        if len(node.args) == 2 and literal(node.args[1]):
+            defaults.setdefault(node.func.end_lineno, []).append(
+                isinstance(node.args[1], ast.Constant) and absence_stops(node, node.args[1].value, parents))
+        test = parents[node]
+        if len(node.args) == 1 and isinstance(test, ast.Compare) and len(test.ops) == 1 and test.left is node \
+                and isinstance(test.ops[0], (ast.Eq, ast.NotEq, ast.In, ast.NotIn)) and plain_literal(test.comparators[0]) \
+                and ast.literal_eval(test.comparators[0]) is not None and not absence_stops(node, None, parents):
+            found.append(('py-get-compare', node.lineno,
+                          'a missing key reads as None, which this comparison takes for one more ordinary value: a source that leaves '
+                          'the field out looks like one that answered otherwise; index the key, or test for its absence first'))
+    return found, {line for line, stopped in defaults.items() if all(stopped)}
+
+
 def scan(text, lang, settings=NO_SETTINGS):
     """Every finding in `text`, overridden or not, and a note when a check could not run.
 
@@ -373,16 +528,14 @@ def scan(text, lang, settings=NO_SETTINGS):
         stripped = line.strip()
         if not stripped:
             continue
-        if KEYWORD.search(MARK.sub('', line)) and not KEYWORD_NEGATED.search(line):
+        keyword = KEYWORD.search(MARK.sub('', line))
+        if keyword and not KEYWORD_NEGATED.search(line) and not NOTHING.search(line[:keyword.start()]):
             found.add(('keyword', number, 'names a fallback or lenient error handling; say what happens to the error'))
         if stripped.startswith('#'):
             continue
         for rule, pattern, why in (PY_LINES if lang == 'py' else SH_LINES):
             if pattern.search(line):
                 found.add((rule, number, why))
-        if lang == 'sh' and unpinned(line):
-            found.add(('sh-unpinned-install', number, f"no exact version for {', '.join(unpinned(line))}: the run gets whatever is newest that "
-                                                      'day, and a later run cannot be compared with it; pin with == to what was tested'))
         if settings['limit_basis']:
             why = limit_without_basis(line, lines[number-2] if number > 1 else '', LIMIT_PY if lang == 'py' else LIMIT_SH)
             if why:
@@ -394,10 +547,23 @@ def scan(text, lang, settings=NO_SETTINGS):
             tree = ast.parse(text)
             found.update(python_tree(tree))
             found.update(python_calls(tree, settings['explicit_arguments']))
+            compared, spared = python_gets(tree)
+            found.update(compared)
+            # In a file that parses, `or <literal>` counts where the code has one: the same words in a docstring are prose.
+            stand_ins = {node.values[-1].lineno for node in ast.walk(tree)
+                         if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or) and literal(node.values[-1])}
+            found -= {finding for finding in found if (finding[0] == 'py-get-default' and finding[1] in spared)
+                      or (finding[0] == 'py-or-default' and finding[1] not in stand_ins)}
         except SyntaxError as error:
             note = f'the file does not parse (line {error.lineno}), so only the regex passes ran'
     else:
         found.update(shell_structure(lines))
+        found.update(shell_defaults(lines))
+        for number, line in enumerate(lines, 1):
+            names = unpinned(line, settings['folder']) if not line.strip().startswith('#') else []
+            if names:
+                found.add(('sh-unpinned-install', number, f"no exact version for {', '.join(names)}: the run gets whatever is newest that "
+                                                          'day, and a later run cannot be compared with it; pin with == to what was tested'))
         if not re.search(r'^\s*set\s+-[a-z]*e', text, re.M) and len([l for l in lines if l.strip() and not l.strip().startswith('#')]) > 2:
             found.add(('sh-no-errexit', 1, 'no `set -e` (prefer `set -euo pipefail`): a failed command does not stop the script'))
 
@@ -448,8 +614,11 @@ a real fault (a changed API, a typo in a key, a broken upstream step), would any
 
 Some cases are a neighbouring shape, flagged for the same cause: a wait or a network call with no time limit, a \
 machine removed with a single unchecked call, an install with no exact version, a library call that leaves an \
-argument to its default, a time limit with no stated basis. Nothing fails in these; something the code does not \
-name decides the outcome. Apply the same test: allow only when the reason names the concrete situation that makes \
+argument to its default, a time limit with no stated basis, a price or amount of money with a default, settings \
+passed on by name prefix, a process search that can match its own shell, a branch that depends on a tool's exact \
+wording in a log, a retry count that understates the time it allows, a pipeline whose status depends on timing, an \
+exit with no message. Nothing fails in these; something the code does not name decides the outcome, or a failure \
+arrives without its reason. Apply the same test: allow only when the reason names the concrete situation that makes \
 the unstated choice the right one here (for example, a wait that the caller itself bounds, shown in the code), and \
 deny a reason that says only that it is unlikely to matter.
 
@@ -594,6 +763,281 @@ ADVICE = [
     'handlers broader than the situation the reason names.']
 
 
+# --- source files written through the shell ----------------------------------------------------------------------
+# An edit made with `sed -i`, a redirect or an inline script never reaches the checks above. This refuses the plain
+# forms of that shortcut. It reads the command as text and is no sandbox: a form it does not know passes.
+
+SOURCE_ENDS = ('.py', '.sh', '.bash', '.zsh')
+TEMP_DIRS = {'/tmp', '/private/tmp', '/var/tmp', '/private/var/tmp', tempfile.gettempdir(), os.path.realpath(tempfile.gettempdir())}
+HEREDOC = re.compile(r'''(?<!<)<<-?\s*\\?(['"]?)([A-Za-z_][\w.-]*)\1''')
+SH_PIECE = re.compile(r'''(?P<escape>\\.)|(?P<single>'[^']*')|(?P<double>")|(?P<substitution>\$\(|`)|(?P<comment>(?<![^\s;&|()<>])#[^\n]*)'''
+                      r'''|(?P<operator>&>>?|>>|>&|>\||<<<|<<-?|<&|&&|\|\||\|&|;;|[;&|()<>\n])|(?P<blank>[^\S\n]+)'''
+                      r'''|(?P<plain>[^\\'"$`#;&|()<>\s]+|[$#])''', re.S)
+SH_IN_DOUBLE = re.compile(r'\\.|\$\(|`|"|[^\\$`"]+|\$', re.S)
+SH_IN_SUBSTITUTION = re.compile(r'''\\.|'[^']*'|"|\$\(|`|\(|\)|[^\\'"$`()]+|\$''', re.S)
+SH_TEXT = {'escape': lambda text: text[1:].replace('\n', ''), 'single': lambda text: text[1:-1], 'substitution': str, 'plain': str,
+           'double': lambda text: re.sub(r'\\([\\"$`])', r'\1', text[1:-1])}
+SH_SEPARATORS = {';', '&', '&&', '||', '|', '|&', ';;', '(', ')', '\n'}
+SH_WRITES_TO = {'>', '>>', '>|', '&>', '&>>', '>&'}
+SH_LEADING = {'then', 'do', 'else', 'elif', 'if', 'while', 'until', '!', '{', 'time', 'sudo', 'command', 'env', 'nohup', 'exec', 'xargs',
+              'export', 'local', 'readonly', 'declare'}
+SH_ASSIGNMENT = re.compile(r'([A-Za-z_]\w*)=(.*)', re.S)
+SH_VARIABLE = re.compile(r'\$(?:(\w+)|\{(\w+)\})')
+SH_UNKNOWN = re.compile(r'[$`]')  # still a variable or a substitution: where the path points is not in the text
+IN_PLACE = {'sed': re.compile(r'-[A-Za-z]*i|--in-place'), 'gsed': re.compile(r'-[A-Za-z]*i|--in-place'),
+            'perl': re.compile(r'-(?![MmI])[A-Za-z0-9]*i'), 'tee': re.compile('tee$')}  # the flag that makes each one write its operands; tee always does
+SH_PLAIN_WRITE = re.compile(r'''(?:\b(?:sed|perl)\b[^|;&\n]*?\s-[A-Za-z0-9]*i[^|;&\n]*?\s|>>?\s*|\btee\s+(?:-a\s+)?)["']?([^\s"'|;&<>()]+\.(?:py|sh|bash|zsh))\b''')
+PY_WRITE_CALL = re.compile(r'''\bwrite_(?:text|bytes)\(|\bopen\([^)]*['"][rbt]*[wax+]''')
+PY_WRITE_MODE = re.compile(r'[rbt]*[wax+][wxabt+]*')
+PY_SOURCE_TEXT = re.compile(r'''['"]([^'"\n]*\.(?:py|sh|bash|zsh))['"]''')
+PATH_CALLS = {'Path', 'PurePath', 'str', 'sorted', 'list', 'set', 'reversed', 'join', 'abspath', 'expanduser', 'resolve', 'absolute',
+              'glob', 'rglob', 'iglob'}
+PATH_MODULES = {'os', 'os.path', 'glob', 'pathlib'}
+
+
+def heredocs(command):
+    """The command with its here-document bodies taken out, and the bodies in order. One left open runs to the end, as in the shell."""
+    kept, bodies, lines = [], [], iter(command.split('\n'))
+    for line in lines:
+        kept.append(line)
+        for opened in HEREDOC.finditer(line):
+            body = []
+            for inner in lines:
+                if inner.strip() == opened.group(2):
+                    break
+                body.append(inner)
+            bodies.append('\n'.join(body))
+    return '\n'.join(kept), bodies
+
+
+def substitution_end(text, at):
+    """Index just past the `$( )` or backtick substitution that opens at `at`."""
+    if text[at] == '`':
+        if '`' not in text[at+1:]:
+            raise ValueError('a backtick is never closed')
+        return text.index('`', at+1) + 1
+    depth, at = 1, at + 2
+    while depth:
+        piece = SH_IN_SUBSTITUTION.match(text, at)
+        if piece is None:
+            raise ValueError('a quote or a $( is never closed')
+        opener = piece.group()
+        at = SH_NESTED[opener](text, at) if opener in SH_NESTED else piece.end()
+        depth += (opener == '(') - (opener == ')')
+    return at
+
+
+def quote_end(text, at, inside):
+    """Index just past the double-quoted string that opens at `at`. A `$( )` in it may hold quotes of its own; the commands
+    of each one are added to `inside`."""
+    at += 1
+    while True:
+        piece = SH_IN_DOUBLE.match(text, at)
+        if piece is None:
+            raise ValueError('a double quote is never closed')
+        if piece.group() == '"':
+            return piece.end()
+        if piece.group() in ('$(', '`'):
+            end = substitution_end(text, at)
+            inside.append(text[at+len(piece.group()):end-1])
+            at = end
+        else:
+            at = piece.end()
+
+
+SH_NESTED = {'"': lambda text, at: quote_end(text, at, []), '$(': substitution_end, '`': substitution_end}
+
+
+def shell_words(text):
+    """`text` as (word, is_operator) pairs with the quotes taken off, and the commands inside its `$( )` and backticks.
+    Raises ValueError where a quote or a substitution does not close."""
+    out, inside, word, at = [], [], None, 0
+    while at < len(text):
+        piece = SH_PIECE.match(text, at)
+        if piece is None:
+            raise ValueError(f'a quote is never closed (character {at})')
+        group, end = piece.lastgroup, piece.end()
+        if group == 'double':
+            end = quote_end(text, at, inside)
+        elif group == 'substitution':
+            end = substitution_end(text, at)
+            inside.append(text[at+len(piece.group()):end-1])
+        if group in SH_TEXT:
+            word = SH_TEXT[group](text[at:end]) if word is None else word + SH_TEXT[group](text[at:end])
+        else:
+            file_number = word is not None and word.isdigit() and piece.group().startswith(('>', '<'))  # the 2 of 2>file is no word
+            if word is not None and not file_number:
+                out.append((word, False))
+            if group == 'operator':
+                out.append((piece.group(), True))
+            word = None
+        at = end
+    return out + ([(word, False)] if word is not None else []), inside
+
+
+def expanded(word, known):
+    """The texts a word can stand for once the variables the command sets, and those of the environment, are filled in."""
+    texts = [word]
+    for name in {plain if plain else braced for plain, braced in SH_VARIABLE.findall(word)}:
+        values = known[name] if name in known else [os.environ[name]] if name in os.environ else []
+        if values:
+            texts = [SH_VARIABLE.sub(lambda found: value if name in found.groups() else found.group(), text) for text in texts for value in values]
+    return texts
+
+
+def written_source(word, cwd, known):
+    """The Python and shell source files `word` names, as full paths. None for another kind of file, a test, a temp folder, or
+    a path whose place is not in the text: one that keeps a variable after `expanded`, or a relative one when `cwd` is None."""
+    for text in expanded(word, known):
+        if SH_UNKNOWN.search(text) or not text.endswith(SOURCE_ENDS) or (cwd is None and not text.startswith(('/', '~'))):
+            continue
+        path = os.path.normpath(os.path.join(cwd if cwd else '/', os.path.expanduser(text)))
+        if not skipped(path) and 'scratchpad' not in path and not any(path.startswith(folder + '/') for folder in TEMP_DIRS):
+            yield path
+
+
+def python_paths(node, values, seen=()):
+    """The texts a path expression in a script can stand for, or None when a part of it is not written out in the script."""
+    def any_of(nodes, seen):
+        options = [python_paths(option, values, seen) for option in nodes]
+        return None if None in options else [text for option in options for text in option]
+    if isinstance(node, ast.Constant):
+        return [node.value] if isinstance(node.value, str) else None
+    if isinstance(node, ast.Name) and node.id in values and node.id not in seen:
+        return any_of(values[node.id], (*seen, node.id))
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return any_of(node.elts, seen)
+    glue, pieces = '/', []
+    if isinstance(node, ast.JoinedStr):
+        glue, pieces = '', [part.value if isinstance(part, ast.FormattedValue) else part for part in node.values]
+    elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
+        glue, pieces = '/' * isinstance(node.op, ast.Div), [node.left, node.right]
+    elif isinstance(node, ast.Call) and ast.unparse(node.func).rsplit('.', 1)[-1] in PATH_CALLS and not node.keywords:
+        named = isinstance(node.func, ast.Attribute) and ast.unparse(node.func.value) not in PATH_MODULES
+        pieces = [node.func.value, *node.args] if named else node.args
+    texts = [''] if pieces else None
+    for piece in pieces:
+        options = python_paths(piece, values, seen)
+        if options is None:
+            return None
+        texts = [text + glue * bool(text) + option for text in texts for option in options]
+    return texts
+
+
+def python_writes(code, cwd):
+    """(form, path) for the source files an inline Python script writes with write_text, write_bytes or open(..., 'w'), where the
+    script spells the path out. A script that does not parse is refused if it writes a file and names a source file at all."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as error:
+        names = PY_SOURCE_TEXT.findall(code) if PY_WRITE_CALL.search(code) else []
+        return [(f'an inline Python script that does not parse (line {error.lineno}), so its writes cannot be followed, and that names',
+                 path) for name in names for path in written_source(name, cwd, {})]
+    values, texts = {}, []
+    for node in ast.walk(tree):
+        pairs = [(target, node.value) for target in node.targets] if isinstance(node, ast.Assign) else \
+            [(node.target, node.iter)] if isinstance(node, (ast.For, ast.comprehension)) else \
+            [(node.target, node.value)] if isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value else []
+        for target, value in pairs:
+            if isinstance(target, ast.Name):
+                values.setdefault(target.id, []).append(value)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        called = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else ''
+        receiver = [func.value] if isinstance(func, ast.Attribute) else []
+        modes = [a for a in [*node.args[:2], *(k.value for k in node.keywords if k.arg == 'mode')]
+                 if isinstance(a, ast.Constant) and isinstance(a.value, str) and PY_WRITE_MODE.fullmatch(a.value)]
+        subjects = receiver if called in ('write_text', 'write_bytes') else receiver + node.args[:1] if called == 'open' and modes else []
+        for subject in subjects:
+            options = python_paths(subject, values)
+            if options:
+                texts += options
+    return [('an inline Python script writing', path) for text in texts for path in written_source(text, cwd, {})]
+
+
+def command_writes(words, targets, body, cwd, known):
+    """(form, path) for the source files one simple command writes, and the folder the command after it runs in.
+    `targets` are its output redirects, `body` its here-document; `known` holds the variables set so far, and is added to."""
+    found = [('a redirect to', path) for target in targets for path in written_source(target, cwd, known)]
+    while words and (words[0] in SH_LEADING or SH_ASSIGNMENT.fullmatch(words[0])):
+        assigned = SH_ASSIGNMENT.fullmatch(words[0])
+        if assigned:
+            known[assigned.group(1)] = expanded(assigned.group(2), known)
+        words = words[1:]
+    if not words:
+        return found, cwd
+    name = re.sub(r'[\d.]+$', '', os.path.basename(words[0]))
+    if words[0] == 'for' and words[2:3] == ['in']:
+        known[words[1]] = [text for word in words[3:] for text in expanded(word, known)]
+    if name in ('cd', 'pushd'):
+        places = [os.path.expanduser(text) for text in expanded(words[1], known)] if len(words) == 2 else []
+        placed = len(places) == 1 and places[0] != '-' and not SH_UNKNOWN.search(places[0]) and (cwd or places[0].startswith('/'))
+        cwd = os.path.normpath(os.path.join(cwd if cwd else '/', places[0])) if placed else None
+    if name in IN_PLACE and any(IN_PLACE[name].match(word) for word in words):
+        found += [(f'{name} writing', path) for word in words[1:] if not word.startswith('-') for path in written_source(word, cwd, known)]
+    if name in INLINE:
+        # The script an interpreter is given on its command line (-c) or, when no script file is named, on a here-document.
+        code = words[words.index('-c')+1] if '-c' in words[:-1] else body if all(word.startswith('-') for word in words[1:]) else None
+        if code is not None:
+            found += INLINE[name](code, cwd)
+    return found, cwd
+
+
+def shell_writes(command, cwd):
+    """(form, path) for each Python or shell source file a command writes other than through an edit tool: an output redirect or
+    `tee` to one, `sed -i` or `perl -i` on one, and an inline `python -c` / `python - <<EOF` or `bash -c` script that does the same.
+    Raises ValueError for a command whose quoting cannot be followed."""
+    text, bodies = heredocs(command)
+    tokens, inside = shell_words(text)
+    found = [pair for inner in inside for pair in shell_writes(inner, cwd)]
+    known, words, targets, body, at = {}, [], [], None, 0
+    tokens.append(('\n', True))
+    while at < len(tokens):
+        token, is_operator = tokens[at]
+        operand = tokens[at+1][0] if at + 1 < len(tokens) and not tokens[at+1][1] else None
+        at += 1
+        if not is_operator:
+            words.append(token)
+        elif token in SH_SEPARATORS:
+            pairs, cwd = command_writes(words, targets, body, cwd, known)
+            found += pairs
+            words, targets, body = [], [], None
+        elif operand is not None:
+            at += 1
+            if token in SH_WRITES_TO and not (token == '>&' and re.fullmatch(r'\d+|-', operand)):
+                targets.append(operand)
+            if token in ('<<', '<<-'):
+                if not bodies:
+                    raise ValueError(f'the here-document {operand} could not be read')
+                body = bodies.pop(0)
+    return found
+
+
+INLINE = {'python': python_writes, 'bash': shell_writes, 'sh': shell_writes, 'zsh': shell_writes}
+
+
+def shell_call(call):
+    """Refuse a Bash command that writes a source file, which would get past the checks an edit goes through."""
+    command, cwd = call['tool_input']['command'], call['cwd'] if 'cwd' in call else os.getcwd()
+    try:
+        found = shell_writes(command, cwd)
+    except ValueError as error:
+        # Not followed, so not judged in full: refused only when the text plainly holds one of the write forms on a source file.
+        plain = [match.group(1) for match in SH_PLAIN_WRITE.finditer(command)]
+        plain += PY_SOURCE_TEXT.findall(command) if re.search(r'\bpython', command) and PY_WRITE_CALL.search(command) else []
+        found = [(f'(the command could not be read in full: {error}) a write to', path)
+                 for name in plain for path in written_source(name, cwd, {})]
+    if not found:
+        return 0
+    print('\n'.join(['no-silent-fallbacks: blocked this command, which is not an edit and writes source files through the shell, where the change is not checked.', '',
+                     *(f'  {form} {path}' for form, path in dict.fromkeys(found)), '',
+                     'Make the change with the Write or Edit tool, so that it is checked like any other edit. A file in a temp '
+                     'folder or a tests folder is not refused, and neither is reading a source file.']), file=sys.stderr)
+    return 2
+
+
 # --- hook --------------------------------------------------------------------------------------------------------
 
 def after_edit(tool, tool_input, before):
@@ -625,11 +1069,9 @@ def introduced(before, after, lang, settings=NO_SETTINGS):
     return fresh, note
 
 
-def hook():
-    call = json.load(sys.stdin)
+def edit_call(call):
+    """Refuse a Write, Edit or MultiEdit that adds a finding to a Python or shell file."""
     tool, tool_input = call['tool_name'], call['tool_input']
-    if tool not in ('Write', 'Edit', 'MultiEdit') or os.environ.get(GUARD):
-        return 0
     path = tool_input['file_path']
     if skipped(path) or (os.path.exists(path) and os.path.samefile(path, __file__)):
         return 0
@@ -648,14 +1090,24 @@ def hook():
     if not refused:
         return 0
     out = [f'no-silent-fallbacks: blocked this edit to {path}. It adds {len(refused)} place(s) where an error or a '
-           'missing value could be swallowed instead of propagating, or where a wait, a version or a setting is left '
-           'for something else to decide:', '']
+           'missing value could be swallowed instead of propagating, or where a wait, a version, a setting or the '
+           'outcome of a check is left for something else to decide:', '']
     for _, finding in refused:
         out += describe(finding)
     if note:
         out += ['', f'Note: {note}.']
     print('\n'.join(out + [''] + ADVICE), file=sys.stderr)
     return 2
+
+
+HOOKED = {'Write': edit_call, 'Edit': edit_call, 'MultiEdit': edit_call, 'Bash': shell_call}
+
+
+def hook():
+    call = json.load(sys.stdin)
+    if call['tool_name'] not in HOOKED or os.environ.get(GUARD):
+        return 0
+    return HOOKED[call['tool_name']](call)
 
 
 # --- scan --------------------------------------------------------------------------------------------------------

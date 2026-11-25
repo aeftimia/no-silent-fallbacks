@@ -87,7 +87,7 @@ ALLOWED = {
     'bounded.sh': "set -euo pipefail\nfor tool in curl tar; do command -v \"$tool\"; done\n"
                   "curl -sf --max-time 5 http://127.0.0.1:8000/v1/models\n"
                   "END=$((SECONDS+600))\nwhile ((SECONDS < END)); do curl -sf --max-time 5 \"$URL\" && break; sleep 5; done\n"
-                  "until runpodctl remove pod \"$POD_ID\"; do\n  ((tries++ < 20)) || exit 3\n  sleep 30\ndone\n"
+                  "until runpodctl remove pod \"$POD_ID\"; do\n  ((tries++ < 20)) || { echo 'removal refused 20 times' >&2; exit 3; }\n  sleep 30\ndone\n"
                   "nohup bash -c \"sleep 60; until runpodctl remove pod '$POD_ID'; do sleep 30; done\" &\n"
                   "pip install -q -r requirements.txt -e . torch==2.15.0 'vllm==0.34.0'\n"
                   "while IFS= read -r line; do echo \"$line\"; done < names.txt\n",
@@ -108,6 +108,120 @@ BLOCKED_PY.update({
     'py-no-timeout': "import requests\ndef ask(url, body):\n    return requests.post(url, json=body).json()\n",
     'py-no-timeout ': "from urllib.request import urlopen\ndef ask(url):\n    return urlopen(url).read()\n",
 })
+
+
+# Shapes the first rules missed, found when the tool was run over a real project, and the fixes that must pass.
+BLOCKED_PY.update({
+    'py-get-compare': "def cut_off(choice):\n    return choice.get('finish_reason') == 'length'\n",
+    'py-get-compare ': "def failed(result):\n    return 1 if result.get('reason') in ('stage_failure', 'measurement_failure') else 0\n",
+    'py-get-default  ': "def empty(protocol):\n    return protocol.get('development_rows', 0) <= 0\n",
+    'py-or-default ': "def weights(row):\n    return row['weights'] or [0.0]\n",
+    'py-or-default  ': "def tone(row):\n    return dict(tone=row['tone'] or 'neutral')\n",
+    'py-divide-guard ': "def speed(tokens, seconds):\n    return tokens/max(seconds, 1e-9)\n",
+    'py-divide-guard  ': "def mean(loss, count):\n    return loss.sum() / count.clamp(min=1)\n",
+    'py-money-default': "import argparse\nap = argparse.ArgumentParser()\nap.add_argument('--judge-usd-in', type=float,\n                default=0.0)\n",
+    'keyword ': "def drop(p):\n    # a missing file is swallowed here and nothing is printed\n    return p\n",
+})
+BLOCKED_SH.update({
+    'sh-default-expansion ': "set -euo pipefail\n[[ ${JUDGE_KIND:-api} == api ]] && echo api\nJUDGE_KIND=${JUDGE_KIND:-api}\nls\n",
+    'sh-prefix-forward': "set -euo pipefail\nwhile IFS='=' read -r name value; do FORWARD+=\"$name=$value \"; done < <(env | grep '^SMOKE_')\necho \"$FORWARD\"\nls\n",
+    'sh-prefix-forward ': "set -euo pipefail\n[[ $name =~ ^SMOKE_[A-Z_]+$ ]] || { echo \"invalid $name\"; exit 2; }\necho ok\nls\n",
+    'sh-pgrep-self': "set -euo pipefail\nssh \"$HOST\" \"pgrep -f 'runpodctl remove pod' > /dev/null\" && echo armed\necho done\nls\n",
+    'sh-grep-log': "set -euo pipefail\nif grep -q 'raise the token limit: True' probe.log; then LIMIT=4096; fi\necho \"$LIMIT\"\nls\n",
+    'sh-grep-log ': "set -euo pipefail\ngrep -i 'unknown vllm environment variable' serve.log && exit 1\necho ok\nls\n",
+    'sh-retry-worst-case': "set -euo pipefail\nfor _ in $(seq 180); do\n  curl -sf --max-time 5 \"$URL\" > /dev/null && break\n  sleep 5\ndone\necho up\n",
+    'sh-pipefail-grep-q': "set -euo pipefail\ncd /workspace\ncurl -sf --max-time 5 \"$URL\" | grep -q \"$MODEL\"\necho up\n",
+    'sh-bare-exit': "set -euo pipefail\n[[ $REMOTE == ops/*.sh ]] || exit 2\necho go\nls\n",
+})
+ALLOWED.update({
+    'closed.py': "def check(protocol, result):\n    if protocol.get('development_rows', 0) <= 0:\n        raise ValueError('no development rows')\n"
+                 "    if result.get('status') != 'completed' or result.get('kind') not in ('probe', 'train'):\n        raise ValueError(result)\n"
+                 "    if result.get('note'):\n        print(result['note'])\n    return result['finish_reason'] == 'length'\n",
+    'nothing.py': '"""A hard wall-clock limit for a paid process that nothing downstream can swallow."""\nLIMIT = 1\n',
+    'required.py': "import argparse\nap = argparse.ArgumentParser()\nap.add_argument('--judge-usd-in', type=float, required=True)\n"
+                   "ap.add_argument('--retries', type=int, default=3)\ndef speed(tokens, seconds):\n    return tokens/seconds\n",
+    'named.sh': "set -euo pipefail\nSTAGE_CAP=${STAGE_CAP:-8.0}\nif [[ ${KEEP_POD:-0} == 1 ]]; then echo kept; fi\n"
+                "for name in SMOKE_STEPS SMOKE_EVAL_LIMIT; do [[ -z ${!name:-} ]] || FORWARD+=\"$name=${!name} \"; done\n"
+                "ssh \"$HOST\" \"pgrep -f '[r]unpodctl remove pod' > /dev/null\" && echo armed\n"
+                "if python probe.py --needs-more-tokens; then LIMIT=4096; fi\n"
+                "END=$((SECONDS+900))\nwhile ((SECONDS < END)); do curl -sf --max-time 5 \"$URL\" > /dev/null && break; sleep 5; done\n"
+                "models=$(curl -sf --max-time 5 \"$URL\")\ngrep -q \"$MODEL\" <<< \"$models\"\n"
+                "[[ $REMOTE == ops/*.sh ]] || { echo 'the remote script must be ops/*.sh' >&2; exit 2; }\n",
+})
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason='reading pyproject.toml needs tomllib')
+def test_a_bare_name_is_pinned_when_the_file_the_line_names_pins_it(tmp_path):
+    (tmp_path / 'ops').mkdir()
+    (tmp_path / 'pyproject.toml').write_text('[project]\nname = "x"\ndependencies = ["requests>=2.31"]\n'
+                                             '[project.optional-dependencies]\ntrain = ["torch==2.15.0", "trl==1.14.1"]\n')
+    install = "set -euo pipefail\ncd /workspace\npip install -q %s -r requirements.txt\necho done\n"
+    (tmp_path / 'requirements.txt').write_text('# the package with its training extra\n-e .[train]\n')
+    assert write(tmp_path, 'ops/setup.sh', install % 'torch') == (0, '')
+    code, report = write(tmp_path, 'ops/setup.sh', install % 'torch vllm requests')
+    assert code == 2 and 'no exact version for vllm, requests:' in report
+    (tmp_path / 'requirements.txt').write_text('-e .\n')  # the extra that pins torch is no longer installed
+    assert 'no exact version for torch:' in write(tmp_path, 'ops/setup.sh', install % 'torch')[1]
+    (tmp_path / 'requirements.txt').write_text('-e .[gpu]\n')
+    code, report = write(tmp_path, 'ops/setup.sh', install % 'torch')
+    assert code == 2 and "KeyError: 'gpu'" in report and 'check itself failed' in report
+
+
+def shell(command, **call):
+    done = subprocess.run([sys.executable, str(HOOK)], capture_output=True, text=True,
+                          input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'cwd': '/work/project', **call}))
+    return done.returncode, done.stderr
+
+
+# An edit made in the shell is checked by nobody. Each refused command is a way a source file was rewritten around the hook.
+SHELL_WRITES = {
+    "sed -i 's/timeout=30/timeout=None/' src/pkg/client.py": 'sed writing /work/project/src/pkg/client.py',
+    "sed -E -i.bak 's/set -e//' ops/job.sh && rm ops/job.sh.bak": 'sed writing /work/project/ops/job.sh',
+    "perl -pi -e 's/raise/pass/' src/pkg/client.py": 'perl writing /work/project/src/pkg/client.py',
+    "echo 'pull || true' >> ops/job.sh": 'a redirect to /work/project/ops/job.sh',
+    "printf 'x = 1\n' | tee src/pkg/new.py > /dev/null": 'tee writing /work/project/src/pkg/new.py',
+    "cat > src/pkg/new.py <<'EOF'\ntry:\n    run()\nexcept Exception:\n    pass\nEOF": 'a redirect to /work/project/src/pkg/new.py',
+    "cd src/pkg && git status; cat <<EOF > new.py\nx = 1\nEOF": 'a redirect to /work/project/src/pkg/new.py',
+    "python3 - <<'EOF'\nfrom pathlib import Path\np = Path('src/pkg/client.py')\np.write_text(p.read_text().replace('raise', 'pass'))\nEOF":
+        'an inline Python script writing /work/project/src/pkg/client.py',
+    "python3 -c \"open('ops/job.sh', 'a').write('pull || true')\"": 'an inline Python script writing /work/project/ops/job.sh',
+    "python - <<EOF\nimport glob\nfor name in glob.glob('src/**/*.py'):\n    text = open(name).read()\n    open(name, 'w').write(text)\nEOF":
+        'an inline Python script writing /work/project/src/**/*.py',
+    "for f in ops/*.sh; do sed -i 's/-euo/-uo/' \"$f\"; done": 'sed writing /work/project/ops/*.sh',
+    "bash -c \"sed -i s/a/b/ src/pkg/client.py\"": 'sed writing /work/project/src/pkg/client.py',
+    "python gen.py > /work/project/src/pkg/generated.py": 'a redirect to /work/project/src/pkg/generated.py',
+    "sed -i 's/it's/its/' src/pkg/client.py": 'could not be read in full: a quote is never closed',
+    "python3 -c \"open('src/pkg/client.py', 'w').write(\"": 'does not parse (line 1)',
+}
+SHELL_PASSES = [
+    'true || true', 'git status', 'python3 -m pytest -q', 'grep -n x src/a.py > /tmp/out.txt', "sed -n '1,20p' src/a.py",
+    "sed 's/a/b/' src/a.py | head", "sed -i 's/a/b/' README.md", "sed -i 's/a/b/' tests/test_a.py", 'echo x > tests/helper.py',
+    "cat > /tmp/probe.py <<'EOF'\nprint(1 > 0)\nEOF", "cd /tmp/work && cat > probe.py <<EOF\nx = 1\nEOF",
+    "S=/private/tmp/session/scratchpad; mkdir -p $S && echo 'set -e' > $S/try.sh", 'D=$(mktemp -d); echo x > "$D/a.py"',
+    'python3 src/a.py > out.txt 2>&1', "python3 - <<EOF\nprint(open('src/a.py').read())\nopen('/tmp/out.txt', 'w').write('x')\nEOF",
+    "echo 'write it with > src/a.py'", 'git commit -m "fix: don\'t redirect > a.py"', 'ls  # don\'t > x.py', "echo it's",
+    'cd "$(dirname "$0")/.." && wc -l ops/job.sh | tee /tmp/count.txt', 'diff <(sort a.py) <(sort b.py)', 'cp src/a.py src/b.py',
+    'ssh host "echo x > a.py"', "perl -ne 'print if /x/' src/a.py", 'bash ops/job.sh 2>&1 | tail -5', 'chmod +x ops/job.sh',
+]
+
+
+@pytest.mark.parametrize('command', SHELL_WRITES)
+def test_a_command_that_writes_a_source_file_is_refused(command):
+    code, report = shell(command)
+    assert code == 2 and SHELL_WRITES[command] in report and 'Write or Edit tool' in report
+
+
+@pytest.mark.parametrize('command', SHELL_PASSES)
+def test_reads_other_files_tests_and_temp_folders_pass(command):
+    assert shell(command) == (0, '')
+
+
+def test_a_relative_path_is_placed_by_the_working_directory(tmp_path):
+    done = subprocess.run([sys.executable, str(HOOK)], capture_output=True, text=True, cwd='/',
+                          input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'echo x > job.sh'}}))
+    assert done.returncode == 2 and 'a redirect to /job.sh' in done.stderr  # no cwd in the call: the hook's own
+    assert shell('echo x > job.sh', cwd='/tmp/work') == (0, '')
+    assert shell('cd /tmp/work; cd /work/project && echo x > job.sh')[0] == 2
 
 
 def configured(tmp_path, name, content):
@@ -174,7 +288,7 @@ def test_python_shapes_are_blocked(tmp_path, rule):
 @pytest.mark.parametrize('rule', BLOCKED_SH)
 def test_shell_shapes_are_blocked(tmp_path, rule):
     code, report = write(tmp_path, 'job.sh', BLOCKED_SH[rule])
-    assert code == 2 and f'[{rule}]' in report
+    assert code == 2 and f'[{rule.strip()}]' in report
 
 
 @pytest.mark.parametrize('name', ALLOWED)
@@ -210,7 +324,6 @@ def test_tests_and_other_files_are_left_alone(tmp_path):
     assert run('Write', file_path=str(tmp_path / 'tests' / 'helper.py'), content=BLOCKED_PY['py-suppress']) == (0, '')
     assert write(tmp_path, 'test_thing.py', BLOCKED_PY['py-suppress']) == (0, '')
     assert write(tmp_path, 'notes.md', 'fall back to the defaults || true') == (0, '')
-    assert run('Bash', command='true || true') == (0, '')
 
 
 def test_unparseable_python_still_gets_line_checks_and_says_so(tmp_path):

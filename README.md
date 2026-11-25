@@ -39,6 +39,8 @@ Prints every finding and exits 1 if there are any. Override comments are listed 
 
 On every `Write`, `Edit` and `MultiEdit` of a Python or shell file, the hook builds the file as it would be after the edit and judges only what the edit adds. Existing code is left for `scan`. A refusal blocks the edit (exit code 2) and the report goes back to Claude.
 
+On every `Bash` command it refuses one that writes a Python or shell source file itself, because that change would reach the file unchecked (see [Edits made in the shell](#edits-made-in-the-shell)).
+
 ```bash
 git clone https://github.com/aeftimia/no-silent-fallbacks ~/.claude/hooks/no-silent-fallbacks
 ```
@@ -50,7 +52,7 @@ Then in `~/.claude/settings.json` (all projects) or a project's `.claude/setting
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Write|Edit|MultiEdit",
+        "matcher": "Write|Edit|MultiEdit|Bash",
         "hooks": [
           {"type": "command", "command": "python3 ~/.claude/hooks/no-silent-fallbacks/no_silent_fallbacks.py", "timeout": 150}
         ]
@@ -61,6 +63,29 @@ Then in `~/.claude/settings.json` (all projects) or a project's `.claude/setting
 ```
 
 If the hook itself crashes it blocks the edit and says the check failed. A guard that waves edits through when it breaks would be the thing it exists to prevent.
+
+### Edits made in the shell
+
+An edit made with `sed -i` or a here-document never passes through the edit tools, so nothing above sees it. With `Bash` in the matcher, the hook reads each command and refuses these ways of writing a file that ends in `.py`, `.sh`, `.bash` or `.zsh`:
+
+- an output redirect (`>`, `>>`, `>|`, `&>`) or `tee` to it, which covers `cat > x.py <<EOF`;
+- `sed -i` (and `--in-place`) or `perl -i` on it;
+- an inline script, `python -c '...'` or `python - <<EOF`, that calls `write_text`, `write_bytes` or `open(..., 'w')` on a path the script spells out (a literal, a `Path(...)` or `glob` of literals, or a name assigned from one);
+- any of these inside `bash -c '...'`, `$( )` or backticks.
+
+The refusal names the file and says to make the change with the Write or Edit tool, where it is checked.
+
+Not refused: reading a source file, a write to any other kind of file, a command that only mentions a source file inside quotes, test files and the other paths the scanner skips, and anything under a temp folder (`/tmp`, `/private/tmp`, `/var/tmp`, `$TMPDIR`, or a path containing `scratchpad`). A relative path is placed by the working directory the hook is given and by any `cd` earlier in the command; variables set in the command, `for` loop variables and the environment are filled in.
+
+It is a line of defence against the lazy route, not a sandbox. It prefers to miss an unusual form over refusing an ordinary command, and it does not see:
+
+- a path it cannot place from the text: one held in a variable the command does not set, or built from `$(...)`;
+- `cp`, `mv`, `patch`, `git apply`, `git checkout`, `dd`, `awk -i inplace`, `ed`, an editor, `xargs sed -i` with the file names on standard input;
+- a script file that does the writing (`python fix.py`), a command sent elsewhere (`ssh host "..."`), `eval`;
+- an inline script whose path comes from an argument, a function or `__file__`, or that writes by another call (`shutil.copy`, `os.replace`);
+- a source file with no extension, which the scanner knows only by its first line.
+
+A command whose quoting cannot be followed (an unclosed quote) is refused only when its text plainly holds one of the write forms on a source file, and the refusal says the command could not be read. An inline Python script that does not parse is refused when it both writes a file and names a source file.
 
 ## The judge
 
@@ -89,24 +114,32 @@ Every rule is the shape of a bug that was found in review of a real codebase and
 | `py-except-broad` | `except Exception` / bare `except` with no re-raise | a timeout caught by a handler meant for something else |
 | `py-error-to-neutral` | `if <error condition>: return ''` (or `0`, `[]`, `{}`) | a failed API call scored as an empty reply, so a revoked key gave a passing run |
 | `py-get-default` | `.get(key, <literal>)`: `0`, `False`, `''`, `{}`, `9.99`, `'USD'` | missing usage counters metered as $0, so a spend cap never tripped |
+| `py-get-compare` | `.get(key) == 'text'`, `!=`, `in (...)`, with no default | `choice.get('finish_reason') == 'length'`: a provider that left the field out made every cut-off answer read as not cut off |
 | `py-get-other-field` | `.get('a', row['b'])` | one measurement standing in for another |
-| `py-or-default` | `x or ''`, `or 0`, `or {}`, `or None` | a null reply became an empty string |
+| `py-or-default` | `x or <literal>`: `or ''`, `or 0`, `or None`, `or [0.0]`, `or 'neutral'` | a null reply became an empty string |
 | `py-getattr-default` | `getattr(obj, name, default)` | an option that was never set read as a setting |
 | `py-env-default` | `os.environ.get(name, default)`, `os.getenv(name, default)` | a limit that was meant to be required |
 | `py-suppress` | `contextlib.suppress(...)` | |
 | `py-errors-ignore` | `errors='ignore'` / `'replace'` | |
-| `py-divide-guard` | `x / max(n, 1)` | a rate reported for an empty input |
+| `py-divide-guard` | `x / max(n, 1)`, `/ max(t, 1e-9)`, `/ count.clamp(min=1)` | a rate reported for an empty input |
+| `py-money-default` | `add_argument('--...usd...', default=<number>)`, also `price`, `cost`, `dollar` | a judge's prices defaulted to 0.0, so its spend cap counted every call as free |
 | `py-else-label` | `label = 'a' if cond else 'b'` | records of unknown origin exported under a concrete label |
 | `py-unchecked-command` | `subprocess.run(...)` without `check=True`, result discarded | |
 | `sh-or-true`, `sh-or-echo` | `cmd \|\| true`, `cmd \|\| echo ...` with no exit | a failed copy of results reported as a finished run |
 | `sh-stderr-null` | `2>/dev/null`, `&>/dev/null` | a capability probe that could not tell "unsupported" from "broken" |
-| `sh-default-expansion` | `${VAR:-default}` with a non-empty default | a money cap with a default nobody chose |
+| `sh-default-expansion` | `${VAR:-default}` with a non-empty default, except stated once in the file as `VAR=${VAR:-default}` or inside a `[[ ]]` test | a money cap with a default nobody chose |
+| `sh-bare-exit` | `cmd \|\| exit 2`, `\|\| return 1`, with no message | a launch refused by `[[ ... ]] \|\| exit 2` with no word of why |
 | `sh-errexit-off`, `sh-no-errexit` | `set +e`; a script with no `set -e` | an install step that failed unnoticed |
 | `sh-curl-no-limit` | `curl` with no `--max-time` | |
 | `sh-kill-wait` | `kill $pid; wait` | a server that ignored the signal held a paid machine's cleanup open |
 | `sh-loop-no-limit` | a `while`/`until` loop that sleeps and has no deadline or counter | a readiness wait on a server that was never going to answer |
 | `sh-teardown-once` | `runpodctl remove`, `aws ec2 terminate-instances`, `gcloud compute instances delete` outside a retry loop | one refused removal call was final, and the machine kept billing |
-| `sh-unpinned-install` | `pip install name` with no `==` | an install that stepped back through versions; runs that could not be compared |
+| `sh-unpinned-install` | `pip install name` with no `==` here, in the `-r` file the line names, or in the project it installs | an install that stepped back through versions; runs that could not be compared |
+| `sh-retry-worst-case` | `for _ in $(seq N)` whose body has a `sleep` and a per-try limit (`--max-time`, `timeout`) and no clock | "180 tries of 5 s", documented as 15 minutes, could take 30: each try also had a 5 s limit |
+| `sh-pipefail-grep-q` | `cmd \| grep -q` in a script with `set -o pipefail` | grep left at its first match and the pipeline reported failure after a match |
+| `sh-prefix-forward` | `env \| grep '^SMOKE_'`, `[[ $name =~ ^SMOKE_[A-Z_]+$ ]]`, `compgen -v SMOKE_`, `${!SMOKE_@}` | a misspelt setting was passed on to a script that reads 12 specific names, which ran on its own value |
+| `sh-pgrep-self` | `pgrep -f` / `pkill -f` with a pattern that starts with a literal character | a liveness check for a billing timer, run through `ssh "..."`, was satisfied by its own command line |
+| `sh-grep-log` | `grep 'some wording' x.log` in an `if`, `&&` or `\|\|` | `if grep -q 'raise the token limit: True' probe.log`: a reworded message would switch the rule off |
 | `py-no-timeout` | `requests.get/post/...`, `httpx.*`, `urlopen` with no `timeout` | |
 | `py-implicit-argument` | a registered call without a registered keyword argument (project file, below) | a trainer whose default added a second loss term at 0.9 and decayed the learning rate to zero |
 | `limit-basis` | a time limit with no `cap:` comment, or one below its own stated basis (project file, below) | a job cap sized to the money left, which ran out with the work half done |
@@ -114,7 +147,14 @@ Every rule is the shape of a bug that was found in review of a real codebase and
 
 Counting (`counts.get(k, 0) + 1`) and an exit status returned from `main` are not flagged.
 
-The last eight rules are the same failure seen from the other side. Nothing is caught and nothing fails: a wait, a version or a setting is left for something the code does not name to decide, and the run looks normal.
+Some shapes are left alone because the missing value cannot pass for a real one there:
+
+- `if cfg.get('rows', 0) <= 0: raise ...`, and `.get(key) != 'expected'` in the same position: a comparison with a literal inside an `if` whose branch for the missing key raises. Absence is then treated like any value that fails the check.
+- `VAR=${VAR:-default}` and `[[ ${VAR:-default} == ... ]]`, when the file gives that variable a default in this one place. The same variable defaulted twice, or a default inside a command line, is flagged.
+- A bare package name that an exact `==` pin covers: in the requirements file named with `-r` on the same line, or, when the line or that file installs the project (`.`, `-e .[extra]`), in `[project]` `dependencies` and the named extras of `pyproject.toml`. Each file is the nearest of its name at or above the script. Reading `pyproject.toml` needs Python 3.11; on an older Python the name stays flagged.
+- A keyword after "nothing" ("nothing downstream can swallow this"), and `or 'text'` in a docstring of a file that parses.
+
+The rules from `sh-curl-no-limit` to `limit-basis` are the same failure seen from the other side. Nothing is caught and nothing fails: a wait, a version, a setting or the outcome of a check is left for something the code does not name to decide, and the run looks normal.
 
 ### Rules a project turns on
 
@@ -138,7 +178,7 @@ Patterns see shapes, not meaning. Known misses from the same review:
 - a three-way answer collapsed to two (`return None` for both "invalid" and "could not decide");
 - a weaker implementation chosen by an `if/elif` chain when the stronger one is unavailable;
 - a stale result from an earlier run picked up in place of a missing fresh one;
-- anything written through a shell command (`sed -i`, a heredoc) instead of an edit tool;
+- a source file written by a shell command in one of the forms listed under [Edits made in the shell](#edits-made-in-the-shell) as not seen;
 - languages other than Python and shell.
 
 The patterns also flag legitimate code. That is what the override is for, and why a model, not a regex, decides whether it holds.
