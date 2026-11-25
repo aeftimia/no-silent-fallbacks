@@ -64,9 +64,19 @@ If the hook itself crashes it blocks the edit and says the check failed. A guard
 
 ## The judge
 
-By default the judge is `claude -p --model haiku` with no tools, so it uses your Claude Code login and needs no API key. To use something else, set `NO_SILENT_FALLBACKS_JUDGE` to a command that reads the prompt on stdin and prints a JSON array of `{"case", "verdict", "reasoning"}` objects.
+Which judge runs is an explicit choice, set with `NO_SILENT_FALLBACKS_JUDGE`. One judge never stands in for another.
 
-The code and the comment are sent to that model. Do not point it at a service you would not send the code to.
+| `NO_SILENT_FALLBACKS_JUDGE` | Judge |
+| --- | --- |
+| unset | `claude -p --model haiku` with no tools. Uses your Claude Code login, needs no API key. |
+| `openai` | OpenAI chat completions with `OPENAI_API_KEY`. Model `gpt-5.4-nano`, or `NO_SILENT_FALLBACKS_OPENAI_MODEL`. |
+| any other value | A command that reads the prompt on stdin and prints a JSON array of `{"case", "verdict", "reasoning"}` objects. |
+
+To choose one for the hook, prefix the command in `settings.json`: `NO_SILENT_FALLBACKS_JUDGE=openai python3 ~/.claude/hooks/...`.
+
+The flagged line, about 16 lines around it, the file path and the comment are sent to that model. Do not point it at a service you would not send the code to.
+
+`scan --judge` prints the overrides the judge allowed, with its reasoning, next to the ones it refused, so a lenient verdict can be read and challenged. A small model is a cheap judge, not an infallible one.
 
 ## Rules
 

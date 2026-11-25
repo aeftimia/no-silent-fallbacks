@@ -35,6 +35,8 @@ import subprocess
 import sys
 import tempfile
 import traceback
+import urllib.error
+import urllib.request
 from collections import Counter
 from pathlib import Path
 
@@ -275,6 +277,10 @@ which state), not a guess that it "should not happen" or "may fail";
 `except Exception`, or a handler around code that can fail for other reasons (wrong types, wrong arguments, a typo) \
 is too broad whatever the comment says.
 
+A reason that describes a hypothetical ("if the response is missing fields", "in case the file is absent") \
+without saying when that legitimately happens names no situation: deny. Ask of every case: if this fired because of \
+a real fault (a changed API, a typo in a key, a broken upstream step), would anyone find out? If not, deny.
+
 Deny when the reason only asserts that the value is fine ("reasonable default", "safe", "sensible", "good enough"), \
 restates what the code does, appeals to robustness or graceful handling, says the case is unlikely, or when the \
 result would be indistinguishable downstream from a real one.
@@ -286,33 +292,14 @@ Reply with a JSON array and nothing else, one object per case, in order:
 [{"case": 1, "verdict": "allow" or "deny", "reasoning": "one or two plain sentences"}]'''
 CACHE = Path.home() / '.cache' / 'no-silent-fallbacks' / 'verdicts.json'
 GUARD = 'NO_SILENT_FALLBACKS_JUDGING'
+OPENAI_MODEL = 'gpt-5.4-nano'
 
 
 class JudgeError(Exception):
     """The judge gave no usable verdict. Callers refuse the override; they never treat this as an allow."""
 
 
-def judge_command():
-    custom = os.environ.get('NO_SILENT_FALLBACKS_JUDGE')
-    if custom:
-        return shlex.split(custom)
-    binary = shutil.which('claude')
-    if binary is None:
-        raise JudgeError('no judge: `claude` is not on PATH and NO_SILENT_FALLBACKS_JUDGE is not set')
-    return [binary, '-p', '--model', 'haiku', '--tools', '', '--no-session-persistence', '--system-prompt', JUDGE_SYSTEM]
-
-
-def ask_judge(cases):
-    """Verdicts for (path, finding) cases as (allowed, reasoning), from one call to the judge model."""
-    command = judge_command()
-    parts = []
-    for number, (path, finding) in enumerate(cases, 1):
-        parts.append(f"CASE {number}\nfile: {path}\nrule: {finding['rule']} ({finding['why']})\n"
-                     f"flagged line {finding['line']}: {finding['text']}\nauthor's reason: {finding['reason']}\n"
-                     f"code (the flagged line is marked >>):\n{finding['context']}\n")
-    prompt = '\n'.join(parts) + f'\nGive {len(cases)} verdict(s).'
-    if os.environ.get('NO_SILENT_FALLBACKS_JUDGE'):
-        prompt = JUDGE_SYSTEM + '\n\n' + prompt
+def run_judge(command, prompt):
     try:
         done = subprocess.run(command, input=prompt, capture_output=True, text=True, timeout=120,
                               cwd=tempfile.gettempdir(), env={**os.environ, GUARD: '1'})
@@ -320,7 +307,51 @@ def ask_judge(cases):
         raise JudgeError(f'the judge command did not complete: {error}') from error
     if done.returncode != 0:
         raise JudgeError(f'the judge command exited {done.returncode}: {(done.stderr or done.stdout).strip()[:300]}')
-    reply = done.stdout
+    return done.stdout
+
+
+def openai_judge(prompt):
+    """One chat completion from OpenAI. Chosen only by NO_SILENT_FALLBACKS_JUDGE=openai, never as a substitute."""
+    if 'OPENAI_API_KEY' not in os.environ:
+        raise JudgeError('NO_SILENT_FALLBACKS_JUDGE=openai needs OPENAI_API_KEY in the environment')
+    body = {'model': os.environ.get('NO_SILENT_FALLBACKS_OPENAI_MODEL', OPENAI_MODEL),  # fallback-ok: documented setting; the one default model is the constant above
+            'messages': [{'role': 'system', 'content': JUDGE_SYSTEM}, {'role': 'user', 'content': prompt}]}
+    request = urllib.request.Request('https://api.openai.com/v1/chat/completions', data=json.dumps(body).encode(),
+                                     headers={'Authorization': 'Bearer ' + os.environ['OPENAI_API_KEY'],
+                                              'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return json.load(response)['choices'][0]['message']['content']
+    except urllib.error.HTTPError as error:
+        raise JudgeError(f'OpenAI answered HTTP {error.code}: {error.read().decode(errors="replace")[:300]}') from error
+    except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
+        raise JudgeError(f'the OpenAI call gave no reply: {type(error).__name__}: {error}') from error
+
+
+def judge_reply(prompt):
+    """The judge's text. Which judge is an explicit choice: Claude Code by default, OpenAI or a command when named."""
+    choice = os.environ.get('NO_SILENT_FALLBACKS_JUDGE')
+    if choice == 'openai':
+        return openai_judge(prompt)
+    if choice:
+        return run_judge(shlex.split(choice), JUDGE_SYSTEM + '\n\n' + prompt)
+    binary = shutil.which('claude')
+    if binary is None:
+        raise JudgeError('no judge: `claude` is not on PATH and NO_SILENT_FALLBACKS_JUDGE is not set')
+    return run_judge([binary, '-p', '--model', 'haiku', '--tools', '', '--no-session-persistence',
+                      '--system-prompt', JUDGE_SYSTEM], prompt)
+
+
+def ask_judge(cases):
+    """Verdicts for (path, finding) cases as (allowed, reasoning), from one call to the judge model."""
+    parts = []
+    for number, (path, finding) in enumerate(cases, 1):
+        parts.append(f"CASE {number}\nfile: {path}\nrule: {finding['rule']} ({finding['why']})\n"
+                     f"flagged line {finding['line']}: {finding['text']}\nauthor's reason: {finding['reason']}\n"
+                     f"code (the flagged line is marked >>):\n{finding['context']}\n")
+    reply = judge_reply('\n'.join(parts) + f'\nGive {len(cases)} verdict(s).')
+    if not isinstance(reply, str):
+        raise JudgeError(f'the judge gave no text: {reply!r}')
     try:
         verdicts = json.loads(reply[reply.index('['):reply.rindex(']')+1])
     except ValueError as error:
@@ -356,7 +387,7 @@ def judge(cases):
     return [tuple(known[key]) for key in keys]
 
 
-def refusals(found, use_judge=True):
+def refusals(found, use_judge=True, verbose=False):
     """Split (path, finding) pairs into those refused and the overrides left unjudged.
 
     Refused pairs gain `finding['verdict']`: None for a line with no override, else the judge's reasoning.
@@ -365,7 +396,11 @@ def refusals(found, use_judge=True):
     marked = [(p, f) for p, f in found if f['reason'] is not None]
     if not use_judge:
         return plain, marked
-    denied = [(p, dict(f, verdict=why)) for (p, f), (allowed, why) in zip(marked, judge(marked) if marked else []) if not allowed]
+    verdicts = judge(marked) if marked else []
+    denied = [(p, dict(f, verdict=why)) for (p, f), (allowed, why) in zip(marked, verdicts) if not allowed]
+    for (p, f), (allowed, why) in zip(marked, verdicts):
+        if allowed and verbose:
+            print(f"  {p}: line {f['line']} [{f['rule']}]  override allowed: {f['reason'][:160]}\n      judge: {why}")
     return sorted(plain + denied, key=lambda pf: (pf[0], pf[1]['line'])), []
 
 
@@ -483,7 +518,7 @@ def scan_command(args):
         found += [(path, f) for f in findings]
         if note:
             notes.append(f'{path}: {note}')
-    refused, unjudged = refusals(found, use_judge=args.judge)
+    refused, unjudged = refusals(found, use_judge=args.judge, verbose=True)
     for path, finding in refused:
         print('\n'.join(describe(finding, prefix=f'{path}: ')))
     for path, finding in unjudged:
