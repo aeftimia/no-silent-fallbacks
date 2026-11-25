@@ -96,7 +96,160 @@ SH_LINES = [
     ('sh-errexit-off',
      re.compile(r'\bset\s+(\+e\b|\+o\s+(errexit|pipefail))'),
      'turns off exit-on-error'),
+    ('sh-curl-no-limit',
+     re.compile(r'''\bcurl\s+(?=-|\S*://|["']?\$)(?![^|;&]*(?:--max-time|--connect-timeout|\s-m\s))'''),
+     'a stalled connection makes this wait with no limit, and a wait says nothing; give it --max-time'),
+    ('sh-kill-wait',
+     re.compile(r'\bkill\b[^#|]*?(;|&&)\s*wait\b'),
+     '`wait` after `kill` never returns for a process that ignores the signal; bound it and escalate to KILL'),
 ]
+
+# --- waits with no limit, installs with no version, defaults left to a library -------------------------------------
+# The same family as a swallowed error: nothing fails, and what actually happened was chosen by something
+# the code does not name (a hung peer, the newest release on the day, a library's default).
+
+PIP_INSTALL = re.compile(r'\bpip3?\s+install\b([^|;&>]*)')
+PIP_TAKES_VALUE = {'-r', '--requirement', '-e', '--editable', '-c', '--constraint', '--python', '-i', '--index-url',
+                   '--extra-index-url', '-f', '--find-links', '-t', '--target', '--prefix', '--root'}
+PIP_NAME = re.compile(r'[A-Za-z0-9][\w.-]*(\[[^\]]*\])?([<~!]=?[\w.*]+)?')
+SH_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
+SH_LOOP_OPEN = re.compile(r'(?:^|[;&|(){}]|\bdo\b|\bthen\b|\belse\b)\s*(while|until|for|select)\b')
+SH_LOOP_CLOSE = re.compile(r'(?:^|[;&|(){}])\s*done\b')
+SH_BOUND = re.compile(r'SECONDS|date\s+\+%s|\(\(|\btimeout\b|deadline|tries|attempt|retr(y|ies)|\bseq\b', re.I)
+SH_TEARDOWN = re.compile(r'\brunpodctl\s+(remove|stop)\b|\baws\s+ec2\s+(terminate|stop)-instances\b'
+                         r'|\bgcloud\s+compute\s+instances\s+(delete|stop)\b')
+NETWORK_CALL = re.compile(r'(requests|httpx)\.(get|post|put|patch|delete|head|request)|(urllib\.request\.)?urlopen')
+LIMIT_SH = [re.compile(r'\btimeout\s+(?:-\S+\s+)*(\d+(?:\.\d+)?)[smh]?\b'),
+            re.compile(r'\b\w*(?:TIMEOUT|DEADLINE|WAIT)\w*(?:=|:-)(\d+(?:\.\d+)?)\b')]  # not LIMIT: that names counts as often as times
+LIMIT_PY = [re.compile(r'\b\w*(?:timeout|deadline)\w*\s*=\s*(\d+(?:\.\d+)?)\b(?!\s*[*/.\w])', re.I)]
+CAP = re.compile(r'cap:\s*(\d+(?:\.\d+)?)\s*x\s+(measured|estimated)\s+(\d+(?:\.\d+)?)\s*(s|min|h)\b')
+CAP_MULTIPLE = {'measured': 2.0, 'estimated': 3.0}
+CONFIG_NAME = '.no-silent-fallbacks.json'
+NO_SETTINGS = dict(explicit_arguments={}, limit_basis=False)
+
+
+def unpinned(line):
+    """Package names a `pip install` on this line leaves without an exact version."""
+    names = []
+    for match in PIP_INSTALL.finditer(line):
+        value_next = False
+        for word in match.group(1).split():
+            word = word.strip('\'"')
+            if value_next or word in PIP_TAKES_VALUE:
+                value_next = not value_next
+            elif not word.startswith(('-', '.')) and not re.search(r'[/$@]|==', word) and PIP_NAME.fullmatch(word):
+                names.append(word)
+    return names
+
+
+def shell_structure(lines):
+    """Findings that need more than one line: a polling loop with no limit, a machine removed with a single call."""
+    code = [SH_QUOTED.sub('""', line.split(' #')[0]) if not line.strip().startswith('#') else '' for line in lines]
+    spans, open_loops = [], []
+    for number, line in enumerate(code, 1):
+        events = [(m.start(), 'open', m.group(1)) for m in SH_LOOP_OPEN.finditer(line)] + [(m.start(), 'close', '') for m in SH_LOOP_CLOSE.finditer(line)]
+        for _, event, kind in sorted(events):
+            if event == 'open':
+                open_loops.append((kind, number))
+            elif open_loops:
+                kind, first = open_loops.pop()
+                spans.append((kind, first, number))
+    for kind, first, last in spans:
+        block = '\n'.join(lines[first-1:last])
+        if kind in ('while', 'until') and re.search(r'\bsleep\b', block) and not SH_BOUND.search(block):
+            yield ('sh-loop-no-limit', first,
+                   'this loop polls until something happens and has no limit, so a thing that never happens is waited for at full cost; '
+                   'give it a deadline (SECONDS, a counter) and fail when it passes')
+    for number, line in enumerate(code, 1):  # quoted text is left out: `pgrep -f 'runpodctl remove'` removes nothing
+        match = SH_TEARDOWN.search(line)
+        if not match:
+            continue
+        retried = re.search(r'\b(until|while|for)\b', line[:match.start()]) or any(first <= number <= last for _, first, last in spans)
+        if not retried:
+            yield ('sh-teardown-once', number,
+                   'one refused or dropped call leaves the machine running and billing; retry until it is accepted, then check that it is gone')
+
+
+def splatted(tree):
+    """Keyword names each variable is known to carry when passed as `**name`: from `name = dict(k=...)`,
+    `name = {'k': ...}` and `name['k'] = ...` anywhere in the file."""
+    known = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and isinstance(node.value, ast.Dict):
+                known.setdefault(target.id, set()).update(k.value for k in node.value.keys if isinstance(k, ast.Constant) and isinstance(k.value, str))
+            elif isinstance(target, ast.Name) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == 'dict':
+                known.setdefault(target.id, set()).update(k.arg for k in node.value.keywords if k.arg)
+            elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name) and isinstance(target.slice, ast.Constant) \
+                    and isinstance(target.slice.value, str):
+                known.setdefault(target.value.id, set()).add(target.slice.value)
+    return known
+
+
+def python_calls(tree, explicit):
+    """Calls that leave a choice to a library: a network call with no time limit, a registered call without a registered argument."""
+    known = splatted(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = ast.unparse(node.func)
+        given = {k.arg for k in node.keywords if k.arg}
+        for keyword in node.keywords:
+            if keyword.arg is None and isinstance(keyword.value, ast.Name) and keyword.value.id in known:
+                given |= known[keyword.value.id]
+        unseen = any(k.arg is None and not (isinstance(k.value, ast.Name) and k.value.id in known) for k in node.keywords)
+        if NETWORK_CALL.fullmatch(name) and 'timeout' not in given and not unseen and len(node.args) < 3:
+            yield ('py-no-timeout', node.lineno, 'no timeout: a stalled connection makes this call wait with no limit, and a wait reports nothing')
+        for callee, required in explicit.items():
+            absent = [argument for argument in required if argument not in given]
+            if absent and (name == callee or name.endswith('.' + callee)):
+                yield ('py-implicit-argument', node.lineno,
+                       f"{callee} is called without {', '.join(absent)}: the library's default decides, it is not recorded, and it can "
+                       f'change with the installed version; pass the value by name (registered in {CONFIG_NAME})')
+
+
+def limit_without_basis(line, above, patterns):
+    """Why a time limit on this line is not accepted, or None. Its `cap:` comment gives the unit the limit is read in."""
+    code = line.split('#')[0]
+    values = [float(match.group(1)) for pattern in patterns for match in pattern.finditer(code)]
+    if not values:
+        return None
+    cap = CAP.search(line) or (CAP.search(above) if above.strip().startswith('#') else None)
+    if not cap:
+        return ('a time limit with no stated basis; limits set from a hopeful guess run out and the work is paid for twice. Say what it is '
+                'sized from, on this line or the one above:  # cap: 2x measured <time> <s|min|h>   or   # cap: 3x estimated <time> <s|min|h>')
+    multiple, kind, amount, unit = float(cap.group(1)), cap.group(2), float(cap.group(3)), cap.group(4)
+    if multiple < CAP_MULTIPLE[kind]:
+        return f'a limit on a {kind} time is at least {CAP_MULTIPLE[kind]:g}x it, and this says {multiple:g}x'
+    if min(values) < multiple * amount:
+        return f'the limit {min(values):g} is under {multiple:g} x {amount:g} {unit} = {multiple*amount:g} {unit}, the basis its own comment gives'
+    return None
+
+
+def project_settings(path):
+    """Rules a project turns on, from the nearest CONFIG_NAME at or above the file. A file with unknown or mistyped entries raises.
+
+        {"explicit_arguments": {"GRPOConfig": ["lr_scheduler_type"]},   calls that must name these arguments
+         "limit_basis": ["ops/*.sh"]}                                    files whose time limits need a `cap:` comment
+    """
+    folder = Path(path).resolve().parent
+    for candidate in (folder, *folder.parents):
+        config = candidate / CONFIG_NAME
+        if config.is_file():
+            break
+    else:
+        return NO_SETTINGS
+    raw = json.loads(config.read_text())
+    explicit = raw.pop('explicit_arguments') if 'explicit_arguments' in raw else {}
+    globs = raw.pop('limit_basis') if 'limit_basis' in raw else []
+    if raw or not isinstance(explicit, dict) or not isinstance(globs, list) or not all(isinstance(g, str) for g in globs) or not all(
+            isinstance(names, list) and names and all(isinstance(n, str) for n in names) for names in explicit.values()):
+        raise ValueError(f'{config}: expected "explicit_arguments" (call name to a list of argument names) and "limit_basis" '
+                         f'(a list of path patterns); unknown entries: {sorted(raw)}')
+    relative = Path(path).resolve().relative_to(candidate)
+    return dict(explicit_arguments=explicit, limit_basis=any(relative.match(g) for g in globs))
 EXCEPT_SWALLOW = 'the handler neither re-raises nor looks at the exception: the error ends here and the code carries on'
 # The same shape without a syntax tree, for text that does not parse: an except that goes straight to a constant.
 PY_EXCEPT = re.compile(r'''^[ \t]*except\b[^\n]*:[ \t]*(?:#[^\n]*)?\n?[ \t]*(?:pass|continue|break|return(?:[ \t]+(?:None|True|False|-?\d[\d.]*|''|""|\[\]|\{\}|\(\)))?)[ \t]*(?:#[^\n]*)?$''', re.M)
@@ -208,10 +361,11 @@ def python_tree(tree):
                 yield ('py-unchecked-command', node.lineno, 'the exit status of this command is never looked at')
 
 
-def scan(text, lang):
+def scan(text, lang, settings=NO_SETTINGS):
     """Every finding in `text`, overridden or not, and a note when a check could not run.
 
     A finding is a dict: rule, line, text, why, reason (the override comment's text, or None), context.
+    `settings` are the project's own rules for this file (`project_settings`).
     """
     lines = text.split('\n')
     found, note = set(), None
@@ -226,15 +380,26 @@ def scan(text, lang):
         for rule, pattern, why in (PY_LINES if lang == 'py' else SH_LINES):
             if pattern.search(line):
                 found.add((rule, number, why))
+        if lang == 'sh' and unpinned(line):
+            found.add(('sh-unpinned-install', number, f"no exact version for {', '.join(unpinned(line))}: the run gets whatever is newest that "
+                                                      'day, and a later run cannot be compared with it; pin with == to what was tested'))
+        if settings['limit_basis']:
+            why = limit_without_basis(line, lines[number-2] if number > 1 else '', LIMIT_PY if lang == 'py' else LIMIT_SH)
+            if why:
+                found.add(('limit-basis', number, why))
     if lang == 'py':
         for match in PY_EXCEPT.finditer(text):
             found.add(('py-except-swallow', text.count('\n', 0, match.start())+1, EXCEPT_SWALLOW))
         try:
-            found.update(python_tree(ast.parse(text)))
+            tree = ast.parse(text)
+            found.update(python_tree(tree))
+            found.update(python_calls(tree, settings['explicit_arguments']))
         except SyntaxError as error:
             note = f'the file does not parse (line {error.lineno}), so only the regex passes ran'
-    elif not re.search(r'^\s*set\s+-[a-z]*e', text, re.M) and len([l for l in lines if l.strip() and not l.strip().startswith('#')]) > 2:
-        found.add(('sh-no-errexit', 1, 'no `set -e` (prefer `set -euo pipefail`): a failed command does not stop the script'))
+    else:
+        found.update(shell_structure(lines))
+        if not re.search(r'^\s*set\s+-[a-z]*e', text, re.M) and len([l for l in lines if l.strip() and not l.strip().startswith('#')]) > 2:
+            found.add(('sh-no-errexit', 1, 'no `set -e` (prefer `set -euo pipefail`): a failed command does not stop the script'))
 
     handlers = {number for rule, number, _ in found if rule.startswith('py-except')}
 
@@ -280,6 +445,13 @@ is too broad whatever the comment says.
 A reason that describes a hypothetical ("if the response is missing fields", "in case the file is absent") \
 without saying when that legitimately happens names no situation: deny. Ask of every case: if this fired because of \
 a real fault (a changed API, a typo in a key, a broken upstream step), would anyone find out? If not, deny.
+
+Some cases are a neighbouring shape, flagged for the same cause: a wait or a network call with no time limit, a \
+machine removed with a single unchecked call, an install with no exact version, a library call that leaves an \
+argument to its default, a time limit with no stated basis. Nothing fails in these; something the code does not \
+name decides the outcome. Apply the same test: allow only when the reason names the concrete situation that makes \
+the unstated choice the right one here (for example, a wait that the caller itself bounds, shown in the code), and \
+deny a reason that says only that it is unlikely to matter.
 
 Deny when the reason only asserts that the value is fine ("reasonable default", "safe", "sensible", "good enough"), \
 restates what the code does, appeals to robustness or graceful handling, says the case is unlikely, or when the \
@@ -438,11 +610,11 @@ def after_edit(tool, tool_input, before):
     return text
 
 
-def introduced(before, after, lang):
+def introduced(before, after, lang, settings=NO_SETTINGS):
     """Findings in `after` that are not already in `before`, matched by rule, line text and override reason."""
-    old, _ = scan(before, lang) if before else ([], None)
+    old, _ = scan(before, lang, settings) if before else ([], None)
     have = Counter((f['rule'], f['text'], f['reason']) for f in old)
-    new, note = scan(after, lang)
+    new, note = scan(after, lang, settings)
     fresh = []
     for finding in new:
         key = (finding['rule'], finding['text'], finding['reason'])
@@ -471,12 +643,13 @@ def hook():
     lang = language(path, after)
     if lang is None:
         return 0
-    fresh, note = introduced(before, after, lang)
+    fresh, note = introduced(before, after, lang, project_settings(path))
     refused, _ = refusals([(path, f) for f in fresh])
     if not refused:
         return 0
     out = [f'no-silent-fallbacks: blocked this edit to {path}. It adds {len(refused)} place(s) where an error or a '
-           'missing value could be swallowed instead of propagating:', '']
+           'missing value could be swallowed instead of propagating, or where a wait, a version or a setting is left '
+           'for something else to decide:', '']
     for _, finding in refused:
         out += describe(finding)
     if note:
@@ -514,7 +687,7 @@ def scan_command(args):
         if lang is None:
             continue
         files += 1
-        findings, note = scan(text, lang)
+        findings, note = scan(text, lang, project_settings(path))
         found += [(path, f) for f in findings]
         if note:
             notes.append(f'{path}: {note}')

@@ -102,9 +102,34 @@ Every rule is the shape of a bug that was found in review of a real codebase and
 | `sh-stderr-null` | `2>/dev/null`, `&>/dev/null` | a capability probe that could not tell "unsupported" from "broken" |
 | `sh-default-expansion` | `${VAR:-default}` with a non-empty default | a money cap with a default nobody chose |
 | `sh-errexit-off`, `sh-no-errexit` | `set +e`; a script with no `set -e` | an install step that failed unnoticed |
+| `sh-curl-no-limit` | `curl` with no `--max-time` | |
+| `sh-kill-wait` | `kill $pid; wait` | a server that ignored the signal held a paid machine's cleanup open |
+| `sh-loop-no-limit` | a `while`/`until` loop that sleeps and has no deadline or counter | a readiness wait on a server that was never going to answer |
+| `sh-teardown-once` | `runpodctl remove`, `aws ec2 terminate-instances`, `gcloud compute instances delete` outside a retry loop | one refused removal call was final, and the machine kept billing |
+| `sh-unpinned-install` | `pip install name` with no `==` | an install that stepped back through versions; runs that could not be compared |
+| `py-no-timeout` | `requests.get/post/...`, `httpx.*`, `urlopen` with no `timeout` | |
+| `py-implicit-argument` | a registered call without a registered keyword argument (project file, below) | a trainer whose default added a second loss term at 0.9 and decayed the learning rate to zero |
+| `limit-basis` | a time limit with no `cap:` comment, or one below its own stated basis (project file, below) | a job cap sized to the money left, which ran out with the work half done |
 | `keyword` | "fallback", "best effort", "gracefully", "defensive", "dummy", "silently", "default to", "reasonable default", unless the line negates it | |
 
 Counting (`counts.get(k, 0) + 1`) and an exit status returned from `main` are not flagged.
+
+The last eight rules are the same failure seen from the other side. Nothing is caught and nothing fails: a wait, a version or a setting is left for something the code does not name to decide, and the run looks normal.
+
+### Rules a project turns on
+
+A `.no-silent-fallbacks.json` in the project, found by walking up from the edited file, adds two rules. A file with an unknown or mistyped entry blocks the edit; it is not skipped.
+
+```json
+{
+  "explicit_arguments": {"GRPOConfig": ["lr_scheduler_type", "router_aux_loss_coef"],
+                         "AutoModelForCausalLM.from_pretrained": ["revision", "dtype"]},
+  "limit_basis": ["ops/*.sh"]
+}
+```
+
+- `explicit_arguments` maps a call (matched on the end of its dotted name) to keyword arguments it must be given by name. Arguments that reach it through `**name` count when the file builds that dict with `name = dict(...)`, `name = {...}` or `name['key'] = ...`. The registry only knows defaults that have already cost something; add a line each time one does.
+- `limit_basis` lists files in which a time limit (`timeout N`, a `*TIMEOUT*`, `*DEADLINE*` or `*WAIT*` variable, a Python `timeout=` or `deadline=` number) needs a comment on its line or the one above saying what it is sized from: `# cap: 2x measured 750 s` or `# cap: 3x estimated 10 min`. The multiple must be at least 2 for a measured time and 3 for an estimate, and the limit at least the multiple times the basis. The limit is read in the unit the comment uses. This checks that a basis is stated and the arithmetic holds, not that the measurement is true.
 
 ## What it cannot catch
 

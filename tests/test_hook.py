@@ -82,9 +82,87 @@ ALLOWED = {
     'unknown.py': "def label(task):\n    return task['taskset']\n",
     'negated.py': "def keys(pairs):\n    # Reject duplicate keys instead of silently replacing an earlier field.\n    return dict(pairs)\n",
     'checked.py': "import subprocess\ndef stop():\n    subprocess.run(['pkill', '-f', 'server'], check=True)\n",
-    'strict.sh': "set -euo pipefail\npip install -q thing > install.log 2>&1 || { echo INSTALL_FAILED; exit 1; }\n"
+    'strict.sh': "set -euo pipefail\npip install -q thing==1.2 > install.log 2>&1 || { echo INSTALL_FAILED; exit 1; }\n"
                  "run --max-usd \"${MAX_USD:?set MAX_USD}\"\n[[ -z ${OPTIONAL:-} ]] && echo none\n",
+    'bounded.sh': "set -euo pipefail\nfor tool in curl tar; do command -v \"$tool\"; done\n"
+                  "curl -sf --max-time 5 http://127.0.0.1:8000/v1/models\n"
+                  "END=$((SECONDS+600))\nwhile ((SECONDS < END)); do curl -sf --max-time 5 \"$URL\" && break; sleep 5; done\n"
+                  "until runpodctl remove pod \"$POD_ID\"; do\n  ((tries++ < 20)) || exit 3\n  sleep 30\ndone\n"
+                  "nohup bash -c \"sleep 60; until runpodctl remove pod '$POD_ID'; do sleep 30; done\" &\n"
+                  "pip install -q -r requirements.txt -e . torch==2.15.0 'vllm==0.34.0'\n"
+                  "while IFS= read -r line; do echo \"$line\"; done < names.txt\n",
+    'limited.py': "import requests, urllib.request\ndef ask(url, body, options):\n    requests.post(url, json=body, timeout=30).raise_for_status()\n"
+                  "    extra = dict(timeout=30)\n    extra['verify'] = True\n    return urllib.request.urlopen(url, **extra).read(), requests.get(url, **options)\n",
 }
+# The same rules a project can turn on for its own files.
+CONFIG = {'explicit_arguments': {'GRPOConfig': ['lr_scheduler_type', 'router_aux_loss_coef'], 'AutoModel.from_pretrained': ['dtype']},
+          'limit_basis': ['ops/*.sh', 'src/*/deadline.py']}
+BLOCKED_SH.update({
+    'sh-curl-no-limit': "set -euo pipefail\ncurl -sf http://127.0.0.1:8000/v1/models | grep -q model\necho up\nls\n",
+    'sh-kill-wait': "set -euo pipefail\nserve &\nkill $!; wait\necho stopped\n",
+    'sh-unpinned-install': "set -euo pipefail\nuv pip install -q --python ~/venv/bin/python torch -r requirements.txt\necho done\nls\n",
+    'sh-loop-no-limit': "set -euo pipefail\nserve &\nuntil curl -sf --max-time 5 http://127.0.0.1:8000/health; do\n  sleep 5\ndone\necho up\n",
+    'sh-teardown-once': "set -euo pipefail\nrsync -az out/ host:out/\nrunpodctl remove pod \"$POD_ID\"\necho removed\n",
+})
+BLOCKED_PY.update({
+    'py-no-timeout': "import requests\ndef ask(url, body):\n    return requests.post(url, json=body).json()\n",
+    'py-no-timeout ': "from urllib.request import urlopen\ndef ask(url):\n    return urlopen(url).read()\n",
+})
+
+
+def configured(tmp_path, name, content):
+    (tmp_path / '.no-silent-fallbacks.json').write_text(json.dumps(CONFIG))
+    path = tmp_path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return run('Write', file_path=str(path), content=content)
+
+
+def test_a_registered_call_must_name_its_registered_arguments(tmp_path):
+    train = "from trl import GRPOConfig\ndef config(args):\n    return GRPOConfig(output_dir=args.out, learning_rate=args.lr%s)\n"
+    assert write(tmp_path, 'plain.py', train % '') == (0, '')  # no registry in this project, no rule
+    code, report = configured(tmp_path, 'src/pkg/train.py', train % '')
+    assert code == 2 and '[py-implicit-argument]' in report and 'without lr_scheduler_type, router_aux_loss_coef' in report
+    code, report = configured(tmp_path, 'src/pkg/train.py', train % ", lr_scheduler_type='constant'")
+    assert code == 2 and 'without router_aux_loss_coef:' in report
+    assert configured(tmp_path, 'src/pkg/train.py', train % ", lr_scheduler_type='constant', router_aux_loss_coef=0.0") == (0, '')
+
+
+def test_arguments_passed_through_a_dict_built_in_the_file_count(tmp_path):
+    load = "from transformers import AutoModel\ndef load(args):\n    kwargs = dict(revision=args.revision)\n%s    return AutoModel.from_pretrained(args.model, **kwargs)\n"
+    code, report = configured(tmp_path, 'load.py', load % '')
+    assert code == 2 and 'AutoModel.from_pretrained is called without dtype' in report
+    assert configured(tmp_path, 'load.py', load % "    kwargs['dtype'] = args.dtype\n") == (0, '')
+    assert configured(tmp_path, 'tokens.py', "def load(Tokenizer, name):\n    return Tokenizer.from_pretrained(name)\n") == (0, '')
+
+
+@pytest.mark.parametrize('line, reason', [
+    ('timeout 1500 python bench.py', 'no stated basis'),
+    ('READY_WAIT=180', 'no stated basis'),
+    ('timeout 1500 python bench.py  # cap: 1.5x measured 750 s', 'at least 2x'),
+    ('timeout 1500 python bench.py  # cap: 2x estimated 750 s', 'at least 3x'),
+    ('DEADLINE=19  # cap: 2x measured 17 min', 'is under 2 x 17 min = 34 min'),
+    ('run --wait "${READY_WAIT:-180}"  # cap: 3x estimated 390 s', 'is under'),
+])
+def test_a_time_limit_needs_a_basis_at_the_multiple_where_the_project_asks(tmp_path, line, reason):
+    script = f"set -euo pipefail\ncd /workspace\n{line}\necho done\n"
+    code, report = configured(tmp_path, 'ops/job.sh', script)
+    assert code == 2 and '[limit-basis]' in report and reason in report
+    code, report = configured(tmp_path, 'elsewhere/job.sh', script)
+    assert '[limit-basis]' not in report
+
+
+def test_a_limit_with_its_basis_passes(tmp_path):
+    assert configured(tmp_path, 'ops/job.sh', "set -euo pipefail\n# cap: 2x measured 750 s\ntimeout 1500 python bench.py\n"
+                      "READY_WAIT=1200  # cap: 3x estimated 390 s\ntimeout --signal=TERM --kill-after=30 \"$2\" bash \"$1\"\n"
+                      "curl -sf --max-time 5 \"$URL\"\n") == (0, '')
+    assert configured(tmp_path, 'src/pkg/deadline.py', "HARD_DEADLINE_MIN = 45  # cap: 2x measured 30 min\n")[0] == 2
+    assert configured(tmp_path, 'src/pkg/deadline.py', "HARD_DEADLINE_MIN = 60  # cap: 2x measured 30 min\nlimit = timeout=None\n") == (0, '')
+
+
+def test_a_mistyped_project_file_blocks_and_says_the_check_failed(tmp_path):
+    (tmp_path / '.no-silent-fallbacks.json').write_text(json.dumps({'explicit_argument': {}}))
+    code, report = write(tmp_path, 'module.py', 'x = 1\n')
+    assert code == 2 and "unknown entries: ['explicit_argument']" in report and 'check itself failed' in report
 
 
 @pytest.mark.parametrize('rule', BLOCKED_PY)
