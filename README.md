@@ -103,6 +103,12 @@ The flagged line, about 16 lines around it, the file path and the comment are se
 
 `scan --judge` prints the overrides the judge allowed, with its reasoning, next to the ones it refused, so a lenient verdict can be read and challenged. A small model is a cheap judge, not an infallible one.
 
+The OpenAI endpoint uses strict Structured Outputs with a JSON schema for the verdicts object. The checker also validates the response's completion status, refusal, case numbers, verdict count and nonempty reasoning. Invalid or incomplete responses cannot approve an edit. The Claude and custom-command interfaces continue to return a JSON array.
+
+`tests/judge_cases.json` pairs intentionally concealed failures with visible failures. Plausible or dishonest author comments must not excuse invented spend, swallowed exceptions, or false success. The positive cases cover an explicit failed timeout, already-completed cleanup, unknown results excluded from success, and a warning that rejects an implicit choice. The keyword scan still flags the warning: it goes through review rather than gaining a lexical exemption.
+
+Run `python -m pytest tests` for deterministic tests. Run `JUDGE_LIVE_EVAL=1 python -m pytest tests/test_openai_judge.py` with `OPENAI_API_KEY` for live semantic assertions against the configured OpenAI model. Live tests are explicit because they send fixture code to the API and incur usage; they are not a replacement for a project's mandatory commit-time review. A live-test failure is reported, never converted to an expected pass.
+
 ## Rules
 
 Every rule is the shape of a bug that was found in review of a real codebase and later fixed.

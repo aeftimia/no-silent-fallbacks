@@ -586,8 +586,19 @@ def scan(text, lang, settings=NO_SETTINGS):
 
 # --- the judge ---------------------------------------------------------------------------------------------------
 
-JUDGE_SYSTEM = '''You review one kind of code decision: an author has kept a lenient error-handling construct that a \
-linter flagged, and has written a comment giving the reason. You decide whether the reason holds.
+JUDGE_SYSTEM = '''You review a suspicious code construct flagged by a conservative linter, with the author's reason \
+for keeping it. Decide whether the reason holds against the code, rather than assuming the pattern proves a bug.
+
+Every keyword occurrence remains subject to review, including comments, strings and filenames. Trace what the \
+code actually does. A warning that refuses an implicit default is not implementing that default. If the matched \
+text names or describes a mechanism, assess the mechanism visible in context; do not deny merely because there is \
+no lenient construct to justify. Conversely a harmless name does not excuse hidden behavior elsewhere in context.
+
+Follow control flow precisely: return and raise end that path. An explicit failed or unknown result is different \
+from a successful empty result. Check how callers handle that state when shown. A failure that remains visible \
+and prevents success need not be a normal event to be handled. Do not invent a fall-through after return, or \
+require proof that no future code change could ever introduce a bug. Identify an actual concealed failure path \
+in the shown implementation when denying, or say which essential evidence is missing.
 
 The distinction that matters. Handling an error means the program visibly does something different because of it: \
 it stops, retries, reports, or records the item as failed, so that anyone reading the output knows. Swallowing an \
@@ -599,7 +610,8 @@ Start from this position. Fallbacks mostly hide problems. A caught error replace
 value replaced by a default, lets the program finish and look correct, and removes the signal that would have made \
 someone fix the cause later. So the default verdict is "deny", and the comment has to earn "allow".
 
-Allow only when the reason, checked against the code shown, establishes all of these:
+For a construct that substitutes an ordinary value for missing input or a failure, allow only when the reason, \
+checked against the code shown, establishes all of these:
 - the lenient case is a known, normal situation and the reason names it concretely (which input, which provider, \
 which state), not a guess that it "should not happen" or "may fail";
 - the value used in that case is the true value there, or the failure genuinely changes nothing that follows \
@@ -634,6 +646,14 @@ Reply with a JSON array and nothing else, one object per case, in order:
 CACHE = Path.home() / '.cache' / 'no-silent-fallbacks' / 'verdicts.json'
 GUARD = 'NO_SILENT_FALLBACKS_JUDGING'
 OPENAI_MODEL = 'gpt-5.4-nano'
+VERDICT_SCHEMA = {
+    'type': 'object', 'additionalProperties': False, 'required': ['verdicts'],
+    'properties': {'verdicts': {'type': 'array', 'items': {
+        'type': 'object', 'additionalProperties': False,
+        'required': ['case', 'verdict', 'reasoning'],
+        'properties': {'case': {'type': 'integer'},
+                       'verdict': {'type': 'string', 'enum': ['allow', 'deny']},
+                       'reasoning': {'type': 'string'}}}}}}
 
 
 class JudgeError(Exception):
@@ -656,13 +676,25 @@ def openai_judge(prompt):
     if 'OPENAI_API_KEY' not in os.environ:
         raise JudgeError('NO_SILENT_FALLBACKS_JUDGE=openai needs OPENAI_API_KEY in the environment')
     body = {'model': os.environ.get('NO_SILENT_FALLBACKS_OPENAI_MODEL', OPENAI_MODEL),  # fallback-ok: documented setting; the one default model is the constant above
-            'messages': [{'role': 'system', 'content': JUDGE_SYSTEM}, {'role': 'user', 'content': prompt}]}
+            'messages': [{'role': 'system', 'content': JUDGE_SYSTEM + '\nFor this endpoint wrap the array in an object with the sole key verdicts.'},
+                         {'role': 'user', 'content': prompt}],
+            'response_format': {'type': 'json_schema', 'json_schema': {
+                'name': 'source_review', 'strict': True, 'schema': VERDICT_SCHEMA}}}
     request = urllib.request.Request('https://api.openai.com/v1/chat/completions', data=json.dumps(body).encode(),
                                      headers={'Authorization': 'Bearer ' + os.environ['OPENAI_API_KEY'],
                                               'Content-Type': 'application/json'})
     try:
         with urllib.request.urlopen(request, timeout=120) as response:
-            return json.load(response)['choices'][0]['message']['content']
+            choice = json.load(response)['choices'][0]
+        if choice['finish_reason'] != 'stop':
+            raise JudgeError(f'OpenAI judge did not finish: {choice["finish_reason"]}')
+        message = choice['message']
+        if message.get('refusal'):
+            raise JudgeError(f'OpenAI judge refused the request: {message["refusal"]}')
+        parsed = json.loads(message['content'])
+        if not isinstance(parsed, dict) or set(parsed) != {'verdicts'} or not isinstance(parsed['verdicts'], list):
+            raise JudgeError('OpenAI judge did not return the verdicts object required by its schema')
+        return json.dumps(parsed['verdicts'])
     except urllib.error.HTTPError as error:
         raise JudgeError(f'OpenAI answered HTTP {error.code}: {error.read().decode(errors="replace")[:300]}') from error
     except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
@@ -698,8 +730,9 @@ def ask_judge(cases):
     except ValueError as error:
         raise JudgeError(f'the judge reply is not a JSON array ({error}): {reply.strip()[:200]}') from error
     if not isinstance(verdicts, list) or len(verdicts) != len(cases) or any(
-            not isinstance(v, dict) or v.get('verdict') not in ('allow', 'deny') or not isinstance(v.get('reasoning'), str)
-            for v in verdicts):
+            not isinstance(v, dict) or type(v.get('case')) is not int or v['case'] != number
+            or v.get('verdict') not in ('allow', 'deny') or not isinstance(v.get('reasoning'), str) or not v['reasoning'].strip()
+            for number, v in enumerate(verdicts, 1)):
         raise JudgeError(f'the judge reply does not give one allow/deny verdict per case: {reply.strip()[:200]}')
     return [(v['verdict'] == 'allow', v['reasoning']) for v in verdicts]
 

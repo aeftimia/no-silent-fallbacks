@@ -1,5 +1,6 @@
 """Each blocked case is the shape of a bug that was found in review and fixed; each allowed case is its fix."""
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -28,7 +29,7 @@ def judge(tmp_path, monkeypatch):
     monkeypatch.setenv('HOME', str(home))
 
     def answer(mode):
-        monkeypatch.setenv('NO_SILENT_FALLBACKS_JUDGE', f"{sys.executable} {home/'stub.py'} {home/'calls'} {mode}")
+        monkeypatch.setenv('NO_SILENT_FALLBACKS_JUDGE', shlex.join([sys.executable, str(home/'stub.py'), str(home/'calls'), mode]))
     answer.calls = lambda: len((home / 'calls').read_text()) if (home / 'calls').exists() else 0
     answer('crash')
     return answer

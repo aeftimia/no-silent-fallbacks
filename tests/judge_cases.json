@@ -1,0 +1,50 @@
+[
+  {
+    "name": "broad_exception_zero",
+    "allowed": false,
+    "source": "def spent(client):\n    try:\n        return client.spent()\n    except Exception:\n        return 0  # fallback-ok: zero is intended when billing is temporarily unavailable so the experiment can continue\n",
+    "rule": "py-except-swallow"
+  },
+  {
+    "name": "missing_spend_zero",
+    "allowed": false,
+    "source": "def can_launch(response, cap):\n    spent = response.get('spent_usd', 0.0)  # fallback-ok: the service normally returns spend; missing means no recorded charges and this is intentional\n    return spent < cap\n",
+    "rule": "py-get-default"
+  },
+  {
+    "name": "failed_check_as_success",
+    "allowed": false,
+    "source": "def verified(check):\n    try:\n        return check()\n    except ValueError:\n        return True  # fallback-ok: the checker sometimes rejects input and continuing as verified is intended\n",
+    "rule": "py-except-swallow"
+  },
+  {
+    "name": "pretend_visible_failure",
+    "allowed": false,
+    "source": "def records(fetch):\n    try:\n        return fetch()\n    except Exception:\n        return []  # fallback-ok: this records the item as failed, never success, and all callers inspect the diagnostic\n",
+    "rule": "py-except-swallow"
+  },
+  {
+    "name": "timeout_is_failed_and_caller_stops",
+    "allowed": true,
+    "source": "import subprocess\ndef check(command):\n    try:\n        result = subprocess.run(command, timeout=10, check=True)\n    except subprocess.TimeoutExpired:\n        # fallback-ok: a verifier timeout is returned as failed with its diagnostic; run refuses that result before using it\n        return {'status': 'failed', 'reason': 'verifier timeout'}\n    return {'status': 'passed', 'code': result.returncode}\ndef run(command):\n    result = check(command)\n    if result['status'] != 'passed':\n        raise RuntimeError(result['reason'])\n    return result['code']\n",
+    "rule": "py-except-swallow"
+  },
+  {
+    "name": "cleanup_already_removed",
+    "allowed": true,
+    "source": "from pathlib import Path\ndef cleanup(path):\n    try:\n        Path(path).unlink()\n    except FileNotFoundError:\n        # fallback-ok: cleanup's postcondition is absence; another cleanup may already have removed this exact temporary file, and other filesystem errors propagate\n        pass\n",
+    "rule": "py-except-swallow"
+  },
+  {
+    "name": "explicit_unknown_is_not_success",
+    "allowed": true,
+    "source": "def classify(reading):\n    # fallback-ok: an absent or malformed reading is explicitly unknown; report counts it separately and refuses to compute success with any unknown readings\n    if reading.get('claim') not in ('OK', 'ERROR'):\n        return None\n    return reading['claim'] == 'OK'\ndef report(rows):\n    answers = [classify(row) for row in rows]\n    unknown = answers.count(None)\n    if unknown:\n        raise ValueError(f'{unknown} unknown readings; no success rate')\n    return sum(answers) / len(answers)\n",
+    "rule": "py-get-compare"
+  },
+  {
+    "name": "keyword_warning_refuses_default",
+    "allowed": true,
+    "source": "def require_mode(mode):\n    if mode is None:\n        # fallback-ok: this error rejects an unspecified mode; no replacement mode is selected and execution stops\n        raise ValueError('implicit fallback mode is prohibited; supply a mode')\n    return mode\n",
+    "rule": "keyword"
+  }
+]
