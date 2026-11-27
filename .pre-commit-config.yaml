@@ -1,0 +1,11 @@
+repos:
+  - repo: local
+    hooks:
+      - id: dry-audit
+        name: DRY audit of new staged scanner duplication
+        entry: dry-audit --run-hook dry-audit --hook-args --staged --new-only --check
+        language: system
+        pass_filenames: false
+        always_run: true
+        require_serial: true
+        stages: [pre-commit]

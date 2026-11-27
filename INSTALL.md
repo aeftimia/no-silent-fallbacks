@@ -15,3 +15,12 @@ Point a hook command at the installed `no-silent-fallbacks` executable, retainin
 the existing environment setup. Updating on invocation still needs a small trigger;
 uv handles fetching, building, environment locking and installation. Development
 checkouts are independent and are never rewritten by `uv tool upgrade`.
+
+## Reciprocal pre-commit audit
+
+This repository's `.pre-commit-config.yaml` runs DRY's staged, new-only audit.
+Install `dry-audit` through uv as described in that repository, then run
+`pre-commit install` here. `pre-commit run dry-audit --all-files` exercises the hook.
+The DRY repository runs this scanner with `scan --judge .` in its own pre-commit
+configuration. Its judge uses the configured OpenAI credentials; missing verdicts
+refuse that check. Both launchers use uv-managed tools and opportunistic upgrades.
