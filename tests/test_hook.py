@@ -96,8 +96,7 @@ ALLOWED = {
                   "    extra = dict(timeout=30)\n    extra['verify'] = True\n    return urllib.request.urlopen(url, **extra).read(), requests.get(url, **options)\n",
 }
 # The same rules a project can turn on for its own files.
-CONFIG = {'explicit_arguments': {'GRPOConfig': ['lr_scheduler_type', 'router_aux_loss_coef'], 'AutoModel.from_pretrained': ['dtype']},
-          'limit_basis': ['ops/*.sh', 'src/*/deadline.py']}
+CONFIG = {'explicit_arguments': {'GRPOConfig': ['lr_scheduler_type', 'router_aux_loss_coef'], 'AutoModel.from_pretrained': ['dtype']}}
 BLOCKED_SH.update({
     'sh-curl-no-limit': "set -euo pipefail\ncurl -sf http://127.0.0.1:8000/v1/models | grep -q model\necho up\nls\n",
     'sh-kill-wait': "set -euo pipefail\nserve &\nkill $!; wait\necho stopped\n",
@@ -250,28 +249,45 @@ def test_arguments_passed_through_a_dict_built_in_the_file_count(tmp_path):
     assert configured(tmp_path, 'tokens.py', "def load(Tokenizer, name):\n    return Tokenizer.from_pretrained(name)\n") == (0, '')
 
 
-@pytest.mark.parametrize('line, reason', [
-    ('timeout 1500 python bench.py', 'no stated basis'),
-    ('READY_WAIT=180', 'no stated basis'),
-    ('timeout 1500 python bench.py  # cap: 1.5x measured 750 s', 'at least 2x'),
-    ('timeout 1500 python bench.py  # cap: 2x estimated 750 s', 'at least 3x'),
-    ('DEADLINE=19  # cap: 2x measured 17 min', 'is under 2 x 17 min = 34 min'),
-    ('run --wait "${READY_WAIT:-180}"  # cap: 3x estimated 390 s', 'is under'),
-])
-def test_a_time_limit_needs_a_basis_at_the_multiple_where_the_project_asks(tmp_path, line, reason):
-    script = f"set -euo pipefail\ncd /workspace\n{line}\necho done\n"
-    code, report = configured(tmp_path, 'ops/job.sh', script)
-    assert code == 2 and '[limit-basis]' in report and reason in report
-    code, report = configured(tmp_path, 'elsewhere/job.sh', script)
-    assert '[limit-basis]' not in report
+TABLES = {
+    'py-chain-table': "def price(model):\n    if model == 'nano':\n        return 0.05\n    elif model == 'mini':\n        return 0.25\n"
+                      "    elif model in ('full', 'pro'):\n        return 1.25\n    else:\n        return 0.5\n",
+    'py-chain-table ': "def price(model):\n    if model == 'nano':\n        return 0.05\n    if model == 'mini':\n        return 0.25\n"
+                       "    if model == 'full':\n        raise ValueError(model)\n    return 0.5\n",
+    'py-chain-table  ': "def port(kind):\n    return 8001 if kind == 'judge' else 8011 if kind == 'policy' else 8000\n",
+    'py-url-equality': "OPENAI_URL = 'https://api.openai.com/v1'\ndef check(args):\n    if args.judge_url == OPENAI_URL and args.cap is None:\n"
+                       "        raise SystemExit('a paid judge needs a cap')\n",
+    'py-url-equality ': "def paid(base):\n    return base != 'http://127.0.0.1:8000/v1'\n",
+    'py-scattered-kind': "def a(args):\n    return args.judge == 'api'\ndef b(args):\n    return 1 if args.judge != 'none' else 2\n"
+                         "def c(args):\n    assert args.judge in ('api', 'local')\ndef d(args):\n    return [args.judge == 'triage']\n",
+}
+TABLE_FREE = {
+    'table.py': "PRICE = {'nano': 0.05, 'mini': 0.25, 'full': 1.25}\ndef price(model):\n    return PRICE[model]\n",
+    'two.py': "def port(kind, n):\n    if kind == 'judge':\n        return 8001\n    elif kind == 'policy':\n        return 8011\n    raise ValueError(kind)\n",
+    'mixed.py': "def step(kind, n, rows):\n    if kind == 'judge':\n        return 1\n    elif n > 3:\n        return 2\n    elif not rows:\n        return 3\n    return 4\n",
+    'host.py': "from urllib.parse import urlsplit\nKNOWN = {'localhost': 0.0}\ndef paid(url):\n    host = urlsplit(url).hostname\n    return KNOWN[host] > 0 or host == 'example.org'\n",
+    'scanner.py': "def depth(text):\n    n = 0\n    for char in text:\n        if char == '{':\n            n += 1\n        if char == '}':\n            n -= 1\n"
+                  "        if char == '\"':\n            n += 0\n        if char in ('[', ']'):\n            n += 0\n    return n\n",
+    'few.py': "def a(args):\n    return args.judge == 'api'\ndef b(args):\n    return args.judge != 'none', args.mode == 'x'\nif __name__ == '__main__':\n    a(None)\n",
+}
 
 
-def test_a_limit_with_its_basis_passes(tmp_path):
-    assert configured(tmp_path, 'ops/job.sh', "set -euo pipefail\n# cap: 2x measured 750 s\ntimeout 1500 python bench.py\n"
-                      "READY_WAIT=1200  # cap: 3x estimated 390 s\ntimeout --signal=TERM --kill-after=30 \"$2\" bash \"$1\"\n"
-                      "curl -sf --max-time 5 \"$URL\"\n") == (0, '')
-    assert configured(tmp_path, 'src/pkg/deadline.py', "HARD_DEADLINE_MIN = 45  # cap: 2x measured 30 min\n")[0] == 2
-    assert configured(tmp_path, 'src/pkg/deadline.py', "HARD_DEADLINE_MIN = 60  # cap: 2x measured 30 min\nlimit = timeout=None\n") == (0, '')
+@pytest.mark.parametrize('rule', TABLES)
+def test_a_value_picked_apart_by_comparisons_is_sent_to_a_table(tmp_path, rule):
+    code, report = write(tmp_path, 'module.py', TABLES[rule])
+    assert code == 2 and f'[{rule.strip()}]' in report
+
+
+@pytest.mark.parametrize('name', TABLE_FREE)
+def test_tables_two_way_branches_and_unrelated_tests_pass(tmp_path, name):
+    assert write(tmp_path, name, TABLE_FREE[name]) == (0, '')
+
+
+def test_a_chain_is_reported_once_and_every_scattered_place_is_named(tmp_path):
+    code, report = write(tmp_path, 'module.py', TABLES['py-chain-table'])
+    assert report.count('[py-') == 1 and '3 if/elif branches pick apart one value (model)' in report
+    code, report = write(tmp_path, 'module.py', TABLES['py-scattered-kind'])
+    assert report.count('[py-scattered-kind]') == 4 and 'args.judge is compared with text in 4 places' in report and '(lines 2, 4, 6, 8)' in report
 
 
 def test_a_mistyped_project_file_blocks_and_says_the_check_failed(tmp_path):

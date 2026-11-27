@@ -150,7 +150,9 @@ Every rule is the shape of a bug that was found in review of a real codebase and
 | `sh-grep-log` | `grep 'some wording' x.log` in an `if`, `&&` or `\|\|` | `if grep -q 'raise the token limit: True' probe.log`: a reworded message would switch the rule off |
 | `py-no-timeout` | `requests.get/post/...`, `httpx.*`, `urlopen` with no `timeout` | |
 | `py-implicit-argument` | a registered call without a registered keyword argument (project file, below) | a trainer whose default added a second loss term at 0.9 and decayed the learning rate to zero |
-| `limit-basis` | a time limit with no `cap:` comment, or one below its own stated basis (project file, below) | a job cap sized to the money left, which ran out with the work half done |
+| `py-chain-table` | three or more `if/elif` branches, early returns in a row, or outcomes of a nested `a if .. else b if .. else c`, all comparing one name with constants | |
+| `py-scattered-kind` | one name compared with string literals in four or more places in a file | |
+| `py-url-equality` | `==`, `!=` or `in` on a URL: a literal with `://`, or a name containing `url`, `uri` or `endpoint` | a check that a paid endpoint has a spend cap, skipped by a trailing slash |
 | `keyword` | "fallback", "best effort", "gracefully", "defensive", "dummy", "silently", "default to", "reasonable default", unless the line negates it | |
 
 Counting (`counts.get(k, 0) + 1`) and an exit status returned from `main` are not flagged.
@@ -162,22 +164,24 @@ Some shapes are left alone because the missing value cannot pass for a real one 
 - A bare package name that an exact `==` pin covers: in the requirements file named with `-r` on the same line, or, when the line or that file installs the project (`.`, `-e .[extra]`), in `[project]` `dependencies` and the named extras of `pyproject.toml`. Each file is the nearest of its name at or above the script. Reading `pyproject.toml` needs Python 3.11; on an older Python the name stays flagged.
 - A keyword after "nothing" ("nothing downstream can swallow this"), and `or 'text'` in a docstring of a file that parses.
 
-The rules from `sh-curl-no-limit` to `limit-basis` are the same failure seen from the other side. Nothing is caught and nothing fails: a wait, a version, a setting or the outcome of a check is left for something the code does not name to decide, and the run looks normal.
+The rules from `sh-curl-no-limit` to `py-implicit-argument` are the same failure seen from the other side. Nothing is caught and nothing fails: a wait, a version, a setting or the outcome of a check is left for something the code does not name to decide, and the run looks normal.
+
+The three before `keyword` ask for a lookup or dispatch table. A chain's `else`, or the far side of a lone `==`, is where a case nobody listed goes unseen; a dict indexed by the value has one visible row per known case and raises on any other. Read the table with `table[key]`: `table.get(key, default)` puts the unseen path back, and `py-get-default` flags it. A two-way branch is left alone.
 
 ### Rules a project turns on
 
-A `.no-silent-fallbacks.json` in the project, found by walking up from the edited file, adds two rules. A file with an unknown or mistyped entry blocks the edit; it is not skipped.
+A `.no-silent-fallbacks.json` in the project, found by walking up from the edited file, adds a rule. A file with an unknown or mistyped entry blocks the edit; it is not skipped.
 
 ```json
 {
   "explicit_arguments": {"GRPOConfig": ["lr_scheduler_type", "router_aux_loss_coef"],
-                         "AutoModelForCausalLM.from_pretrained": ["revision", "dtype"]},
-  "limit_basis": ["ops/*.sh"]
+                         "AutoModelForCausalLM.from_pretrained": ["revision", "dtype"]}
 }
 ```
 
 - `explicit_arguments` maps a call (matched on the end of its dotted name) to keyword arguments it must be given by name. Arguments that reach it through `**name` count when the file builds that dict with `name = dict(...)`, `name = {...}` or `name['key'] = ...`. The registry only knows defaults that have already cost something; add a line each time one does.
-- `limit_basis` lists files in which a time limit (`timeout N`, a `*TIMEOUT*`, `*DEADLINE*` or `*WAIT*` variable, a Python `timeout=` or `deadline=` number) needs a comment on its line or the one above saying what it is sized from: `# cap: 2x measured 750 s` or `# cap: 3x estimated 10 min`. The multiple must be at least 2 for a measured time and 3 for an estimate, and the limit at least the multiple times the basis. The limit is read in the unit the comment uses. This checks that a basis is stated and the arithmetic holds, not that the measurement is true.
+
+How long a time limit should be, and what a run may cost, is a project's own policy, not a sign of a swallowed error, so this hook does not check it. A project that sizes its limits by a rule checks that in its own tests.
 
 ## What it cannot catch
 

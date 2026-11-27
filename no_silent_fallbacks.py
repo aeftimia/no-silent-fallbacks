@@ -85,7 +85,7 @@ PY_LINES = [
      'a floor under the divisor (max(n, 1), max(t, 1e-9), clamp(min=1)) reports a rate for empty input instead of saying there was none'),
     ('py-else-label',
      re.compile(r'''=\s*.*\bif\b.+\belse\s+(['"])[A-Za-z][\w-]*\1(?!\s*(if|\+|%|\.))'''),
-     'the else branch gives every unrecognised case a concrete label; make "unknown" its own value or raise'),
+     'the else branch gives every unrecognised case a concrete label; index a table of the known cases so an unlisted one raises, or make "unknown" its own value'),
 ]
 SH_LINES = [
     ('sh-or-true',
@@ -141,13 +141,8 @@ SH_TEARDOWN = re.compile(r'\brunpodctl\s+(remove|stop)\b|\baws\s+ec2\s+(terminat
                          r'|\bgcloud\s+compute\s+instances\s+(delete|stop)\b')
 MONEY = re.compile(r'usd|price|cost|dollar', re.I)
 NETWORK_CALL = re.compile(r'(requests|httpx)\.(get|post|put|patch|delete|head|request)|(urllib\.request\.)?urlopen')
-LIMIT_SH = [re.compile(r'\btimeout\s+(?:-\S+\s+)*(\d+(?:\.\d+)?)[smh]?\b'),
-            re.compile(r'\b\w*(?:TIMEOUT|DEADLINE|WAIT)\w*(?:=|:-)(\d+(?:\.\d+)?)\b')]  # not LIMIT: that names counts as often as times
-LIMIT_PY = [re.compile(r'\b\w*(?:timeout|deadline)\w*\s*=\s*(\d+(?:\.\d+)?)\b(?!\s*[*/.\w])', re.I)]
-CAP = re.compile(r'cap:\s*(\d+(?:\.\d+)?)\s*x\s+(measured|estimated)\s+(\d+(?:\.\d+)?)\s*(s|min|h)\b')
-CAP_MULTIPLE = {'measured': 2.0, 'estimated': 3.0}
 CONFIG_NAME = '.no-silent-fallbacks.json'
-NO_SETTINGS = dict(explicit_arguments={}, limit_basis=False, folder=None)
+NO_SETTINGS = dict(explicit_arguments={}, folder=None)
 PIP_PROJECT = re.compile(r'\.(?:\[([\w,.-]+)\])?')
 PIP_PIN = re.compile(r'\s*([A-Za-z0-9][\w.-]*)(?:\[[^\]]*\])?\s*==\s*[\w.!+-]+\s*(?:;.*)?')
 SH_DEFAULT = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*):?[-=][^}]+\}')
@@ -285,6 +280,104 @@ def splatted(tree):
     return known
 
 
+# --- one value picked apart by comparisons, where a table would name every case ------------------------------------
+# A chain's `else`, or the far side of a lone `==`, is where an unlisted case goes unseen. A table indexed by the
+# value has one visible row per known case and raises on any other.
+
+CHAIN_BRANCHES = 3     # an if/elif chain, a run of early returns, or a nested conditional expression of this many outcomes
+SCATTERED_PLACES = 4   # separate comparisons of one name with text in one file
+LOCATION_NAME = re.compile(r'(^|_)(url|uri|endpoint)s?(_|$)', re.I)
+
+
+def compared(test, kinds, text_only=False):
+    """Source of the name or attribute that `test` compares with constants (`x == 'a'`, `x in ('a', 'b')`), else None."""
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], kinds)):
+        return None
+    right = test.comparators[0]
+    items = right.elts if isinstance(right, (ast.Tuple, ast.List, ast.Set)) else [right]
+    wanted = (str,) if text_only else (str, int)
+    if not isinstance(test.left, (ast.Name, ast.Attribute)) or not items or not all(
+            isinstance(item, ast.Constant) and type(item.value) in wanted for item in items):
+        return None
+    return ast.unparse(test.left)
+
+
+def names_a_location(node):
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str) and '://' in node.value
+    name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else ''
+    return bool(LOCATION_NAME.search(name))
+
+
+def python_tables(tree):
+    """Places where one value is told apart by comparisons and a lookup or dispatch table would name every case."""
+    positive = (ast.Eq, ast.In)
+
+    def chain(subject, count, line, what):
+        return ('py-chain-table', line,
+                f'{count} {what} pick apart one value ({subject}); write the cases as a table, a dict from the value to its result or '
+                'handler, and index it: every known case is then one visible row, and an unlisted one raises where a chain passes it on')
+    in_chain = set()  # tests already reported as part of a chain, left out of the count of scattered comparisons
+    elifs = {id(node.orelse[0]) for node in ast.walk(tree) if isinstance(node, ast.If) and len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If)}
+    inner_choices = {id(node.orelse) for node in ast.walk(tree) if isinstance(node, ast.IfExp) and isinstance(node.orelse, ast.IfExp)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and id(node) not in elifs:
+            tests, branch = [], node
+            while True:
+                tests.append(branch.test)
+                if len(branch.orelse) != 1 or not isinstance(branch.orelse[0], ast.If):
+                    break
+                branch = branch.orelse[0]
+            subjects = {compared(test, positive) for test in tests}
+            if len(tests) >= CHAIN_BRANCHES and len(subjects) == 1 and None not in subjects:
+                in_chain.update(map(id, tests))
+                yield chain(subjects.pop(), len(tests), node.lineno, 'if/elif branches')
+        if isinstance(node, ast.IfExp) and id(node) not in inner_choices:
+            tests, choice = [], node
+            while isinstance(choice, ast.IfExp):
+                tests.append(choice.test)
+                choice = choice.orelse
+            subjects = {compared(test, positive) for test in tests}
+            if len(tests)+1 >= CHAIN_BRANCHES and len(subjects) == 1 and None not in subjects:
+                in_chain.update(map(id, tests))
+                yield chain(subjects.pop(), len(tests)+1, node.lineno, 'outcomes of a nested conditional expression')
+        for field, block in ast.iter_fields(node):
+            if field not in ('body', 'orelse', 'finalbody') or not isinstance(block, list):
+                continue
+            run = []
+            for statement in block + [None]:
+                leaves = isinstance(statement, ast.If) and not statement.orelse and isinstance(statement.body[-1], (ast.Return, ast.Raise, ast.Continue))
+                subject = compared(statement.test, positive) if leaves else None
+                if subject is not None and (not run or run[0][0] == subject):
+                    run.append((subject, statement))
+                    continue
+                if len(run) >= CHAIN_BRANCHES:
+                    in_chain.update(id(member.test) for _, member in run)
+                    yield chain(run[0][0], len(run), run[0][1].lineno, 'early returns in a row')
+                run = [(subject, statement)] if subject is not None else []
+    places = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        if len(node.ops) == 1 and isinstance(node.ops[0], (ast.Eq, ast.NotEq, ast.In, ast.NotIn)) and any(
+                names_a_location(side) for side in [node.left, *node.comparators]) and not all(
+                isinstance(side, ast.Constant) for side in [node.left, *node.comparators]):
+            yield ('py-url-equality', node.lineno,
+                   'a location compared as text: a trailing slash, another scheme or a port makes a different string of the same place, '
+                   'and whatever this guards is skipped; parse it (urlsplit) and look the host up in a table of the hosts this code knows')
+        subject = compared(node, (ast.Eq, ast.NotEq, ast.In, ast.NotIn), text_only=True)
+        one_character = all(isinstance(item, ast.Constant) and len(item.value) <= 1 for item in ast.walk(node.comparators[0])
+                            if isinstance(item, ast.Constant)) if subject is not None else False  # a scanner reading text a character at a time
+        if subject is not None and subject != '__name__' and id(node) not in in_chain and not one_character:
+            places.setdefault(subject, []).append(node.lineno)
+    for subject, lines in places.items():
+        if len(lines) >= SCATTERED_PLACES:
+            for line in sorted(set(lines)):
+                yield ('py-scattered-kind', line,
+                       f'{subject} is compared with text in {len(lines)} places in this file (lines {", ".join(map(str, sorted(set(lines))))}), '
+                       'so each place keeps its own idea of what the kinds are; give the kinds one table of their properties and look them up')
+
+
 def python_calls(tree, explicit):
     """Calls that leave a choice to a library: a network call with no time limit, a registered call without a registered argument."""
     known = splatted(tree)
@@ -313,44 +406,22 @@ def python_calls(tree, explicit):
                        f'change with the installed version; pass the value by name (registered in {CONFIG_NAME})')
 
 
-def limit_without_basis(line, above, patterns):
-    """Why a time limit on this line is not accepted, or None. Its `cap:` comment gives the unit the limit is read in."""
-    code = line.split('#')[0]
-    values = [float(match.group(1)) for pattern in patterns for match in pattern.finditer(code)]
-    if not values:
-        return None
-    cap = CAP.search(line) or (CAP.search(above) if above.strip().startswith('#') else None)
-    if not cap:
-        return ('a time limit with no stated basis; limits set from a hopeful guess run out and the work is paid for twice. Say what it is '
-                'sized from, on this line or the one above:  # cap: 2x measured <time> <s|min|h>   or   # cap: 3x estimated <time> <s|min|h>')
-    multiple, kind, amount, unit = float(cap.group(1)), cap.group(2), float(cap.group(3)), cap.group(4)
-    if multiple < CAP_MULTIPLE[kind]:
-        return f'a limit on a {kind} time is at least {CAP_MULTIPLE[kind]:g}x it, and this says {multiple:g}x'
-    if min(values) < multiple * amount:
-        return f'the limit {min(values):g} is under {multiple:g} x {amount:g} {unit} = {multiple*amount:g} {unit}, the basis its own comment gives'
-    return None
-
-
 def project_settings(path):
     """Rules a project turns on, from the nearest CONFIG_NAME at or above the file. A file with unknown or mistyped entries raises.
 
-        {"explicit_arguments": {"GRPOConfig": ["lr_scheduler_type"]},   calls that must name these arguments
-         "limit_basis": ["ops/*.sh"]}                                    files whose time limits need a `cap:` comment
+        {"explicit_arguments": {"GRPOConfig": ["lr_scheduler_type"]}}   calls that must name these arguments
     """
     folder = Path(path).resolve().parent
     config = nearest(folder, CONFIG_NAME)
     if config is None:
         return dict(NO_SETTINGS, folder=folder)
-    candidate = config.parent
     raw = json.loads(config.read_text())
     explicit = raw.pop('explicit_arguments') if 'explicit_arguments' in raw else {}
-    globs = raw.pop('limit_basis') if 'limit_basis' in raw else []
-    if raw or not isinstance(explicit, dict) or not isinstance(globs, list) or not all(isinstance(g, str) for g in globs) or not all(
+    if raw or not isinstance(explicit, dict) or not all(
             isinstance(names, list) and names and all(isinstance(n, str) for n in names) for names in explicit.values()):
-        raise ValueError(f'{config}: expected "explicit_arguments" (call name to a list of argument names) and "limit_basis" '
-                         f'(a list of path patterns); unknown entries: {sorted(raw)}')
-    relative = Path(path).resolve().relative_to(candidate)
-    return dict(explicit_arguments=explicit, limit_basis=any(relative.match(g) for g in globs), folder=folder)
+        raise ValueError(f'{config}: expected "explicit_arguments" (call name to a list of argument names); '
+                         f'unknown entries: {sorted(raw)}')
+    return dict(explicit_arguments=explicit, folder=folder)
 EXCEPT_SWALLOW = 'the handler neither re-raises nor looks at the exception: the error ends here and the code carries on'
 # The same shape without a syntax tree, for text that does not parse: an except that goes straight to a constant.
 PY_EXCEPT = re.compile(r'''^[ \t]*except\b[^\n]*:[ \t]*(?:#[^\n]*)?\n?[ \t]*(?:pass|continue|break|return(?:[ \t]+(?:None|True|False|-?\d[\d.]*|''|""|\[\]|\{\}|\(\)))?)[ \t]*(?:#[^\n]*)?$''', re.M)
@@ -536,10 +607,6 @@ def scan(text, lang, settings=NO_SETTINGS):
         for rule, pattern, why in (PY_LINES if lang == 'py' else SH_LINES):
             if pattern.search(line):
                 found.add((rule, number, why))
-        if settings['limit_basis']:
-            why = limit_without_basis(line, lines[number-2] if number > 1 else '', LIMIT_PY if lang == 'py' else LIMIT_SH)
-            if why:
-                found.add(('limit-basis', number, why))
     if lang == 'py':
         for match in PY_EXCEPT.finditer(text):
             found.add(('py-except-swallow', text.count('\n', 0, match.start())+1, EXCEPT_SWALLOW))
@@ -547,6 +614,7 @@ def scan(text, lang, settings=NO_SETTINGS):
             tree = ast.parse(text)
             found.update(python_tree(tree))
             found.update(python_calls(tree, settings['explicit_arguments']))
+            found.update(python_tables(tree))
             compared, spared = python_gets(tree)
             found.update(compared)
             # In a file that parses, `or <literal>` counts where the code has one: the same words in a docstring are prose.
