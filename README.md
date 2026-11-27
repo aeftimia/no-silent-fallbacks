@@ -25,6 +25,11 @@ Fallbacks are sometimes right. Mostly they hide problems and keep later revision
 2. **Refusal with a reason.** Each flagged line is reported with what the rule is protecting against.
 3. **Override by comment, checked by a judge.** The author may keep a flagged line by writing `fallback-ok: <reason>` on it, on the line above, or on the first line of an `except` body. The comment is not taken at its word. A judge model reads the reason against the surrounding code and allows or refuses it, with its reasoning. No verdict (judge unreachable, unreadable reply) means refused.
 
+The keyword pass excludes complete mentions of the literal package name
+`no-silent-fallbacks`, including paths and module-registry lookups. Other keywords
+on the same line still count, and the Python and shell rules inspect the original
+source. Names with added prefixes or suffixes do not receive this exception.
+
 The judge starts from "deny". It allows a reason that names a concrete, normal situation in which the lenient value is the true one, on a construct no broader than that situation. It refuses reasons that only assert the value is fine ("reasonable default", "robust", "should not happen"), and any bare or catch-all `except` whatever the comment says.
 
 ## Scan a codebase

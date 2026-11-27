@@ -44,6 +44,8 @@ from pathlib import Path
 
 MARK = re.compile(r'fallback-ok:\s*(\S.*)')
 SKIP_DIRS = {'tests', 'test', 'node_modules', '.venv', 'venv', 'site-packages', '.git', 'vendor'}
+# fallback-ok: This exact package identifier is ordinary naming, so only that complete token is excluded from keyword matching. Other words on the line and every structural rule still inspect the original source; no error or unsuccessful result is concealed.
+PACKAGE_MENTION = re.compile(r'(?<![\w-])no-silent-fallbacks(?![\w-])')
 
 KEYWORD = re.compile(
     r'\b(fallbacks?|fall(s|ing)?[- ]back|fell back|best[- ]effort|graceful(ly)?|degrad(e|es|ed|ing)|just in case'
@@ -635,7 +637,8 @@ def scan(text, lang, settings=NO_SETTINGS):
         stripped = line.strip()
         if not stripped:
             continue
-        keyword = KEYWORD.search(MARK.sub('', line))
+        keyword_line = PACKAGE_MENTION.sub(lambda match: ' ' * len(match.group()), MARK.sub('', line))
+        keyword = KEYWORD.search(keyword_line)
         if keyword and not KEYWORD_NEGATED.search(line) and not NOTHING.search(line[:keyword.start()]):
             found.add(('keyword', number, 'names a fallback or lenient error handling; say what happens to the error'))
         if stripped.startswith('#'):

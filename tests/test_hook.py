@@ -74,6 +74,9 @@ BLOCKED_SH = {
     'sh-no-errexit': "#!/bin/bash\npip install -q thing > install.log 2>&1\npython run.py\necho done\n",
 }
 ALLOWED = {
+    'checker_name.py': "path = updater.source_module('no-silent-fallbacks')\n",
+    'checker_path.py': "path = '/hooks/no-silent-fallbacks/no_silent_fallbacks.py'\n",
+    'checker_name.sh': "set -euo pipefail\nprintf '%s\\n' no-silent-fallbacks\n",
     'raises.py': "import json\ndef read(text):\n    try:\n        return json.loads(text)\n"
                  "    except ValueError as error:\n        raise ValueError(f'unreadable reply: {error}') from error\n",
     'reports.py': "import sys\ndef main(f):\n    try:\n        f()\n    except ValueError as error:\n"
@@ -311,6 +314,28 @@ def test_shell_shapes_are_blocked(tmp_path, rule):
 @pytest.mark.parametrize('name', ALLOWED)
 def test_loud_code_passes(tmp_path, name):
     assert write(tmp_path, name, ALLOWED[name]) == (0, '')
+
+
+@pytest.mark.parametrize('content', [
+    "name = 'my-no-silent-fallbacks'\n",
+    "name = 'no-silent-fallbacks-extra'\n",
+    "name = 'no-silent-fallbacks'; warning = 'fallback to cached success'\n",
+])
+def test_package_mentions_do_not_exempt_other_keyword_matches(tmp_path, content):
+    code, why = write(tmp_path, 'module.py', content)
+    assert code == 2 and '[keyword]' in why
+
+
+def test_package_name_does_not_exempt_a_swallowed_exception(tmp_path):
+    content = "def choose():\n    try:\n        return load()\n    except OSError:\n        return 'no-silent-fallbacks'\n"
+    code, why = write(tmp_path, 'module.py', content)
+    assert code == 2 and '[py-except-swallow]' in why
+
+
+def test_package_name_does_not_exempt_a_shell_default(tmp_path):
+    content = "set -euo pipefail\nchecker=${CHECKER:-no-silent-fallbacks}\nprintf '%s\\n' \"$checker\"\n"
+    code, why = write(tmp_path, 'module.sh', content)
+    assert code == 2 and '[sh-default-expansion]' in why
 
 
 def test_only_what_the_edit_adds_is_reported(tmp_path):
