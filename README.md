@@ -33,7 +33,7 @@ The judge starts from "deny". It allows a reason that names a concrete, normal s
 python3 no_silent_fallbacks.py scan src/ scripts/
 ```
 
-Prints every finding and exits 1 if there are any. Override comments are listed as not judged unless you add `--judge`, which costs one model call per batch of new overrides. Verdicts are cached in `~/.cache/no-silent-fallbacks/verdicts.json`, keyed on the rule, the reason and the surrounding code, so an unchanged override is asked once. Test files and vendored directories are skipped unless you pass `--include-tests`.
+Prints every finding and exits 1 if there are any. Override comments are listed as not judged unless you add `--judge`, which costs one model call per batch of new overrides. Verdicts are cached in `~/.cache/no-silent-fallbacks/verdicts.json`, keyed on the judge criteria, configured command/model, rule, reason and surrounding code. Changing the reviewer invalidates prior approvals even if the source is unchanged. Test files and vendored directories are skipped unless you pass `--include-tests`.
 
 ## Use as a hook
 

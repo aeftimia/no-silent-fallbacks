@@ -39,6 +39,7 @@ def test_openai_requires_strict_schema(monkeypatch):
     schema = form['json_schema']['schema']
     assert schema['additionalProperties'] is False
     assert schema['properties']['verdicts']['items']['additionalProperties'] is False
+    assert list(schema['properties']['verdicts']['items']['properties']) == ['case', 'reasoning', 'verdict']
 
 
 @pytest.mark.parametrize('content,finish,refusal', [
@@ -77,6 +78,26 @@ def test_wrong_case_or_empty_reason_is_not_an_allow(monkeypatch, reply):
     monkeypatch.setattr(checker, 'judge_reply', lambda prompt: reply)
     with pytest.raises(checker.JudgeError):
         checker.ask_judge([finding(CASES[0])])
+
+
+@pytest.mark.parametrize('changed', ['model', 'command', 'criteria'])
+def test_new_reviewer_cannot_reuse_old_approval(tmp_path, monkeypatch, changed):
+    monkeypatch.setattr(checker, 'CACHE', tmp_path/'verdicts.json')
+    calls = []
+    def review(cases):
+        calls.append(cases)
+        return [(len(calls) == 1, 'first reviewer allows; new reviewer denies')]
+    monkeypatch.setattr(checker, 'ask_judge', review)
+    cases = [finding(CASES[0])]
+    assert checker.judge(cases)[0][0] is True
+    assert checker.judge(cases)[0][0] is True and len(calls) == 1
+    if changed == 'model':
+        monkeypatch.setenv('NO_SILENT_FALLBACKS_OPENAI_MODEL', 'another-model')
+    elif changed == 'command':
+        monkeypatch.setenv('NO_SILENT_FALLBACKS_JUDGE', 'another-command')
+    else:
+        monkeypatch.setattr(checker, 'JUDGE_SYSTEM', checker.JUDGE_SYSTEM + '\nNew criteria.')
+    assert checker.judge(cases)[0][0] is False and len(calls) == 2
 
 
 @pytest.mark.skipif(os.environ.get('JUDGE_LIVE_EVAL') != '1', reason='explicit opt-in live API evaluation')

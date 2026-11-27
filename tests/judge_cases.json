@@ -46,5 +46,17 @@
     "allowed": true,
     "source": "def require_mode(mode):\n    if mode is None:\n        # fallback-ok: this error rejects an unspecified mode; no replacement mode is selected and execution stops\n        raise ValueError('implicit fallback mode is prohibited; supply a mode')\n    return mode\n",
     "rule": "keyword"
+  },
+  {
+    "name": "required_reasoning_effort_warning",
+    "allowed": true,
+    "source": "def settle_template(template, reasoning_effort):\n    if ('reasoning_effort' in template) != bool(reasoning_effort):\n        # fallback-ok: callers must supply reasoning effort exactly when the template needs it; this raises instead of allowing the upstream default\n        raise ValueError('--reasoning-effort is required here; unset, that template silently uses medium')\n    return reasoning_effort\n",
+    "rule": "keyword"
+  },
+  {
+    "name": "explicit_development_dataset",
+    "allowed": true,
+    "source": "import argparse\ndef selected_dataset(argv):\n    parser = argparse.ArgumentParser()\n    group = parser.add_mutually_exclusive_group()\n    group.add_argument('--audit', action='store_true')\n    group.add_argument('--holdout', action='store_true')\n    args = parser.parse_args(argv)\n    # fallback-ok: the CLI has three exhaustive states: audit, holdout, or neither (development); contradictory flags are rejected by argparse\n    kind = 'human_audit' if args.audit else 'human_heldout' if args.holdout else 'development'\n    return kind\n",
+    "rule": "py-else-label"
   }
 ]
