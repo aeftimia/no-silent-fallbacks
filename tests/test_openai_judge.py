@@ -20,7 +20,9 @@ CASES = json.loads((Path(__file__).with_name('judge_cases.json')).read_text())
 
 @pytest.fixture(autouse=True)
 def isolated_credentials(tmp_path, monkeypatch):
+    configured = checker.OPENAI_CREDENTIALS_FILE
     monkeypatch.setattr(checker, 'OPENAI_CREDENTIALS_FILE', tmp_path / 'openai.json')
+    return configured
 
 
 def completion(content, finish='stop', refusal=None):
@@ -106,7 +108,8 @@ def test_new_reviewer_cannot_reuse_old_approval(tmp_path, monkeypatch, changed):
 
 @pytest.mark.skipif(os.environ.get('JUDGE_LIVE_EVAL') != '1', reason='explicit opt-in live API evaluation')
 @pytest.mark.parametrize('case', CASES, ids=lambda c: c['name'])
-def test_live_judge_semantics(case, monkeypatch):
+def test_live_judge_semantics(case, monkeypatch, isolated_credentials):
+    monkeypatch.setattr(checker, 'OPENAI_CREDENTIALS_FILE', isolated_credentials)
     monkeypatch.setenv('NO_SILENT_FALLBACKS_JUDGE', 'openai')
     verdict, = checker.ask_judge([finding(case)])
     allowed, reasoning = verdict

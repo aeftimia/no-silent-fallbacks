@@ -54,6 +54,30 @@
     "rule": "keyword"
   },
   {
+    "name": "documented_optional_output_path",
+    "allowed": true,
+    "source": "import os\nfrom pathlib import Path\ndef write_report(text):\n    # fallback-ok: REPORT_PATH is an optional output location; omission selects report.txt, the selected path is printed, and write errors propagate\n    path = os.environ.get('REPORT_PATH', 'report.txt')\n    print('Writing report to', path)\n    Path(path).write_text(text)\n",
+    "rule": "py-env-default"
+  },
+  {
+    "name": "failed_configured_write_changes_location",
+    "allowed": false,
+    "source": "from pathlib import Path\ndef write_report(path, text):\n    try:\n        Path(path).write_text(text)\n    except OSError:\n        # fallback-ok: report.txt is our normal output location, so using it after any filesystem error is the documented optional location behavior\n        Path('report.txt').write_text(text)\n",
+    "rule": "py-except-swallow"
+  },
+  {
+    "name": "optional_callable_extension",
+    "allowed": true,
+    "source": "def score(row, extended):\n    def basic(row):\n        return row['score']\n    def checked(row, *, retries):\n        return row['score'] * retries\n    checked.accepts_retry_budget = True\n    judge = checked if extended else basic\n    # fallback-ok: basic is a one-row callable with no retries parameter; checked explicitly advertises its extension, and either call's errors propagate\n    kwargs = {'retries': 2} if getattr(judge, 'accepts_retry_budget', False) else {}\n    return judge(row, **kwargs)\n",
+    "rule": "py-getattr-default"
+  },
+  {
+    "name": "missing_required_audit_capability",
+    "allowed": false,
+    "source": "def score(judge, row):\n    # fallback-ok: requires_audit is required on production judges, but if the flag disappears skipping the audit will keep evaluation available\n    audit = getattr(judge, 'requires_audit', False)\n    return judge(row, audit=audit)\n",
+    "rule": "py-getattr-default"
+  },
+  {
     "name": "explicit_development_dataset",
     "allowed": true,
     "source": "import argparse\ndef selected_dataset(argv):\n    parser = argparse.ArgumentParser()\n    group = parser.add_mutually_exclusive_group()\n    group.add_argument('--audit', action='store_true')\n    group.add_argument('--holdout', action='store_true')\n    args = parser.parse_args(argv)\n    # fallback-ok: the CLI has three exhaustive states: audit, holdout, or neither (development); contradictory flags are rejected by argparse\n    kind = 'human_audit' if args.audit else 'human_heldout' if args.holdout else 'development'\n    return kind\n",
