@@ -99,13 +99,27 @@ Which judge runs is an explicit choice, set with `NO_SILENT_FALLBACKS_JUDGE`. On
 
 To choose one for the hook, prefix the command in `settings.json`: `NO_SILENT_FALLBACKS_JUDGE=openai python3 ~/.claude/hooks/...`.
 
+OpenAI credentials normally come from `OPENAI_API_KEY`. To explicitly select a current credential source instead of a stale inherited environment, create `~/.config/no-silent-fallbacks/openai.json` containing an argv command, not a secret. For a key exported by interactive zsh:
+
+```json
+{"api_key_command": ["/bin/zsh", "-ic", "printf '%s' \"$OPENAI_API_KEY\""]}
+```
+
+When that file exists, its command is the sole credential source and takes precedence over the inherited key in every working directory. It runs from the home directory with a 15-second timeout and captured output. A failed command, invalid configuration, empty result or whitespace in the result refuses the request; no alternate key is tried. The command must print only the key. No secret is copied into this configuration or the repository. HTTP 401 errors identify the selected source without echoing the credential or server response body. The source is selected before the request, not switched after an authentication failure.
+
 The flagged line, its review context described below, the file path and the comment are sent to that model. Do not point it at a service you would not send the code to.
 
 `scan --judge` prints the overrides the judge allowed, with its reasoning, next to the ones it refused, so a lenient verdict can be read and challenged. A small model is a cheap judge, not an infallible one.
 
 The OpenAI endpoint uses strict Structured Outputs with a JSON schema for the verdicts object. The checker also validates the response's completion status, refusal, case numbers, verdict count and nonempty reasoning. Invalid or incomplete responses cannot approve an edit. The Claude and custom-command interfaces continue to return a JSON array.
 
-Review context starts with the enclosing Python function or method and includes referenced module constants, imports and local helper definitions, following their dependencies. Long functions use 160-line windows with 80-line overlap within the function; shell sources use the same windows across the file. Omitted lines are marked. `review_contexts` returns each view containing the finding, so full-scan callers can require a fresh approval for every view. Edit-hook prompts include all those views. The deterministic scan still checks every source line, and context selection never exempts a finding or accepts an author's comment as proof.
+Review context contains a complete Python lexical unit and its referenced module bindings, imports and helpers, following dependencies. Methods include their entire class, including initialization and reporting methods; nested functions include their enclosing top-level function and closure bindings. Repeated and conditional module bindings are retained. Module-level findings and shell findings receive the complete file. There are no fixed line windows or truncated compound statements. Unrelated omitted source is marked. Non-parsing Python still produces a short excerpt with a diagnostic; callers requiring a complete review must reject that diagnostic.
+
+For a justification that depends on downstream behavior, configure `review_evidence` below. The checker creates one local-behavior case and a separate propagation case for each explicit obligation. Each propagation case includes the producer context and current supporting source, labelled with file and symbol. Every verdict must allow; a local approval cannot substitute for downstream evidence. Without configured obligations, the local case must establish the complete justification. Missing essential evidence must be denied, not inferred from a comment.
+
+References to several symbols in one file are combined, with overlapping dependencies included once. Missing or ambiguous symbols, unreadable or invalid Python evidence, empty evidence files and paths escaping the project fail the check. Same-file evidence uses the proposed edited contents. The cache includes the obligation and its source context, so changing a consumer invalidates the corresponding verdict. Edit hooks still check newly introduced findings: they do not reverse-index consumer edits to discover existing producers in other files. A full repository scan is required to recheck those relationships; Rapid Grant's commit scan does that and rejects stale evidence selectors.
+
+This is conservative source selection, not complete data-flow or call-graph analysis. Imports do not automatically include other files, dynamic dispatch and aliases are not resolved, and configured evidence must actually demonstrate the connection to the consumer. Complete large units and their dependencies can produce large prompts; the checker does not silently trim them. Factor such code into smaller functions or give distinct, explicit downstream obligations. Deterministic scanning still checks every eligible source line, and evidence never exempts a finding.
 
 `tests/judge_cases.json` pairs intentionally concealed failures with visible failures. Plausible or dishonest author comments must not excuse invented spend, swallowed exceptions, or false success. The positive cases cover an explicit failed timeout, already-completed cleanup, unknown results excluded from success, and a warning that rejects an implicit choice. The keyword scan still flags the warning: it goes through review rather than gaining a lexical exemption.
 
@@ -180,6 +194,20 @@ A `.no-silent-fallbacks.json` in the project, found by walking up from the edite
 ```
 
 - `explicit_arguments` maps a call (matched on the end of its dotted name) to keyword arguments it must be given by name. Arguments that reach it through `**name` count when the file builds that dict with `name = dict(...)`, `name = {...}` or `name['key'] = ...`. The registry only knows defaults that have already cost something; add a line each time one does.
+
+`review_evidence` is an optional list matching an exact project-relative `path`, `rule` and stripped finding `text`. Each entry requires nonempty `obligations`; each obligation has a `claim` and nonempty `sources`. Each source names a project-relative `path` and a Python `symbol` (including qualified methods and module constants), or `"*"` for the complete file. Shell evidence uses `"*"`. For example:
+
+```json
+{"review_evidence": [{
+  "path": "producer.py", "rule": "py-except-swallow", "text": "except TimeoutError:",
+  "obligations": [{
+    "claim": "The timeout result is rejected by the consumer, never counted as success.",
+    "sources": [{"path": "consumer.py", "symbol": "consume"}]
+  }]
+}]}
+```
+
+These claims and references supply questions and evidence, not trusted assertions. An override comment or the caller's review-note mechanism must still supply a justification.
 
 How long a time limit should be, and what a run may cost, is a project's own policy, not a sign of a swallowed error, so this hook does not check it. A project that sizes its limits by a rule checks that in its own tests.
 

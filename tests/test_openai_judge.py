@@ -18,6 +18,11 @@ spec.loader.exec_module(checker)
 CASES = json.loads((Path(__file__).with_name('judge_cases.json')).read_text())
 
 
+@pytest.fixture(autouse=True)
+def isolated_credentials(tmp_path, monkeypatch):
+    monkeypatch.setattr(checker, 'OPENAI_CREDENTIALS_FILE', tmp_path / 'openai.json')
+
+
 def completion(content, finish='stop', refusal=None):
     return io.BytesIO(json.dumps({'choices': [{'finish_reason': finish,
         'message': {'content': content, 'refusal': refusal}}]}).encode())
