@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "no-silent-fallbacks"
+version = "0.1.0"
+description = "Detect and review code that hides errors behind substitute success values."
+requires-python = ">=3.12"
+readme = "README.md"
+license = "MIT"
+dependencies = []
+
+[project.scripts]
+no-silent-fallbacks = "no_silent_fallbacks_cli:main"
+
+[tool.setuptools]
+py-modules = ["no_silent_fallbacks", "no_silent_fallbacks_cli"]
