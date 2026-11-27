@@ -60,7 +60,6 @@ def finding(case):
     assert candidates, (case['name'], found)
     item = candidates[0]
     assert item['reason'], (case['name'], item)
-    item['context'] = case['source']
     return case['name']+'.py', item
 
 

@@ -99,11 +99,13 @@ Which judge runs is an explicit choice, set with `NO_SILENT_FALLBACKS_JUDGE`. On
 
 To choose one for the hook, prefix the command in `settings.json`: `NO_SILENT_FALLBACKS_JUDGE=openai python3 ~/.claude/hooks/...`.
 
-The flagged line, about 16 lines around it, the file path and the comment are sent to that model. Do not point it at a service you would not send the code to.
+The flagged line, its review context described below, the file path and the comment are sent to that model. Do not point it at a service you would not send the code to.
 
 `scan --judge` prints the overrides the judge allowed, with its reasoning, next to the ones it refused, so a lenient verdict can be read and challenged. A small model is a cheap judge, not an infallible one.
 
 The OpenAI endpoint uses strict Structured Outputs with a JSON schema for the verdicts object. The checker also validates the response's completion status, refusal, case numbers, verdict count and nonempty reasoning. Invalid or incomplete responses cannot approve an edit. The Claude and custom-command interfaces continue to return a JSON array.
+
+Review context starts with the enclosing Python function or method and includes referenced module constants, imports and local helper definitions, following their dependencies. Long functions use 160-line windows with 80-line overlap within the function; shell sources use the same windows across the file. Omitted lines are marked. `review_contexts` returns each view containing the finding, so full-scan callers can require a fresh approval for every view. Edit-hook prompts include all those views. The deterministic scan still checks every source line, and context selection never exempts a finding or accepts an author's comment as proof.
 
 `tests/judge_cases.json` pairs intentionally concealed failures with visible failures. Plausible or dishonest author comments must not excuse invented spend, swallowed exceptions, or false success. The positive cases cover an explicit failed timeout, already-completed cleanup, unknown results excluded from success, and a warning that rejects an implicit choice. The keyword scan still flags the warning: it goes through review rather than gaining a lexical exemption.
 

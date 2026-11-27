@@ -578,11 +578,84 @@ def scan(text, lang, settings=NO_SETTINGS):
         return None
 
     def context(number):
+        if note is None:
+            return '\n\n--- overlapping review view ---\n\n'.join(review_contexts(text, lang, number))
         first = max(number-9, 0)
         return '\n'.join(f"{'>>' if i+1 == number else '  '} {i+1:4d}  {lines[i]}" for i in range(first, min(number+8, len(lines))))
     return [dict(rule=rule, line=number, text=lines[number-1].strip(), why=why, reason=reason(number), context=context(number))
             for rule, number, why in sorted(found, key=lambda f: (f[1], f[0]))], note
 
+
+CONTEXT_LINES = 160
+CONTEXT_OVERLAP = 80
+
+
+def review_contexts(source, language, line):
+    """Function-first views, with referenced definitions and overlapping windows.
+
+    Every returned view contains the flagged line. Large functions are windowed
+    within their own boundaries; small functions are never cut at a file grid.
+    """
+    lines = source.splitlines()
+    if not 1 <= line <= len(lines):
+        raise ValueError('review line is outside the source')
+    first, last = 0, len(lines)
+    dependencies = []
+    if language == 'py':
+        tree = ast.parse(source)
+        scopes = [node for node in ast.walk(tree)
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                  and node.lineno <= line <= node.end_lineno]
+        scope = min(scopes, key=lambda node: node.end_lineno - node.lineno) if scopes else None
+        if scope is not None:
+            first = min([scope.lineno] + [item.lineno for item in scope.decorator_list]) - 1
+            last = scope.end_lineno
+        bindings = {}
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bindings[node.name] = node
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.Import, ast.ImportFrom)):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    names = [alias.asname or alias.name.split('.')[0] for alias in node.names]
+                else:
+                    names = [item.id for item in ast.walk(node)
+                             if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store)]
+                for name in names:
+                    bindings[name] = node
+        roots = [scope] if scope is not None else [
+            node for node in tree.body if node.lineno <= line <= node.end_lineno]
+        pending = list(roots)
+        seen = {id(node) for node in roots}
+        while pending:
+            node = pending.pop()
+            names = {item.id for item in ast.walk(node)
+                     if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load)}
+            for name in sorted(names & bindings.keys()):
+                dependency = bindings[name]
+                if id(dependency) not in seen:
+                    seen.add(id(dependency))
+                    dependencies.append((dependency.lineno - 1, dependency.end_lineno))
+                    pending.append(dependency)
+    stride = CONTEXT_LINES - CONTEXT_OVERLAP
+    windows = [(start, min(last, start + CONTEXT_LINES))
+               for start in range(first, last, stride)
+               if start <= line - 1 < min(last, start + CONTEXT_LINES)]
+    if last - first <= CONTEXT_LINES:
+        windows = [(first, last)]
+    views = []
+    for start, end in windows:
+        selected = sorted({index for a, b in [(start, end), *dependencies]
+                           for index in range(a, b)})
+        output, previous = [], -1
+        for index in selected:
+            if index != previous + 1:
+                output.append('... omitted lines ...')
+            output.append(f'{">>" if index + 1 == line else "  "} {index + 1:4}  {lines[index]}')
+            previous = index
+        if previous < len(lines) - 1:
+            output.append('... omitted lines ...')
+        views.append('\n'.join(output))
+    return views
 
 # --- the judge ---------------------------------------------------------------------------------------------------
 
