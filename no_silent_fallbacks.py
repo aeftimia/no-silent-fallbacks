@@ -645,7 +645,7 @@ Reply with a JSON array and nothing else, one object per case, in order:
 [{"case": 1, "verdict": "allow" or "deny", "reasoning": "one or two plain sentences"}]'''
 CACHE = Path.home() / '.cache' / 'no-silent-fallbacks' / 'verdicts.json'
 GUARD = 'NO_SILENT_FALLBACKS_JUDGING'
-OPENAI_MODEL = 'gpt-5.4-nano'
+OPENAI_MODEL = 'gpt-5.4-mini'
 VERDICT_SCHEMA = {
     'type': 'object', 'additionalProperties': False, 'required': ['verdicts'],
     'properties': {'verdicts': {'type': 'array', 'items': {

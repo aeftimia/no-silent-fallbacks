@@ -94,7 +94,7 @@ Which judge runs is an explicit choice, set with `NO_SILENT_FALLBACKS_JUDGE`. On
 | `NO_SILENT_FALLBACKS_JUDGE` | Judge |
 | --- | --- |
 | unset | `claude -p --model haiku` with no tools. Uses your Claude Code login, needs no API key. |
-| `openai` | OpenAI chat completions with `OPENAI_API_KEY`. Model `gpt-5.4-nano`, or `NO_SILENT_FALLBACKS_OPENAI_MODEL`. |
+| `openai` | OpenAI chat completions with `OPENAI_API_KEY`. Model `gpt-5.4-mini`, or `NO_SILENT_FALLBACKS_OPENAI_MODEL`. |
 | any other value | A command that reads the prompt on stdin and prints a JSON array of `{"case", "verdict", "reasoning"}` objects. |
 
 To choose one for the hook, prefix the command in `settings.json`: `NO_SILENT_FALLBACKS_JUDGE=openai python3 ~/.claude/hooks/...`.
