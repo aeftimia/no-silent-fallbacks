@@ -987,7 +987,11 @@ def openai_judge(prompt):
                                               'Content-Type': 'application/json'})
     try:
         with urllib.request.urlopen(request, timeout=120) as response:
-            choice = json.load(response)['choices'][0]
+            result = json.load(response)
+            print(json.dumps(dict(guard='no-silent-fallbacks', stage='obligation', model=body['model'],
+                                  response_id=result.get('id'), usage=result.get('usage'))),
+                  file=sys.stderr, flush=True)
+            choice = result['choices'][0]
         if choice['finish_reason'] != 'stop':
             raise JudgeError(f'OpenAI judge did not finish: {choice["finish_reason"]}')
         message = choice['message']
