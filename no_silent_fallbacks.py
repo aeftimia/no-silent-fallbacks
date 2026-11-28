@@ -974,10 +974,15 @@ def openai_api_key():
     return key
 
 
+def openai_model():
+    # fallback-ok: The optional model override selects a different judge. When absent the documented default is OPENAI_MODEL.
+    return os.environ.get('NO_SILENT_FALLBACKS_OPENAI_MODEL', OPENAI_MODEL)
+
+
 def openai_judge(prompt):
     """One chat completion from OpenAI. Chosen only by NO_SILENT_FALLBACKS_JUDGE=openai, never as a substitute."""
     key = openai_api_key()
-    body = {'model': os.environ.get('NO_SILENT_FALLBACKS_OPENAI_MODEL', OPENAI_MODEL),  # fallback-ok: documented setting; the one default model is the constant above
+    body = {'model': openai_model(),
             'messages': [{'role': 'system', 'content': JUDGE_SYSTEM + '\nFor this endpoint wrap the array in an object with the sole key verdicts.'},
                          {'role': 'user', 'content': prompt}],
             'response_format': {'type': 'json_schema', 'json_schema': {

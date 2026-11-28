@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "no-silent-fallbacks"
-version = "0.4.0"
+version = "0.5.0"
 description = "Detect and review code that hides errors behind substitute success values."
 requires-python = ">=3.12"
 readme = "README.md"
